@@ -56,6 +56,17 @@ http://127.0.0.1:27190/
 python3 tools/scrcpy-control-panel.py --no-open
 ```
 
+macOS 也可以双击：
+
+```text
+tools/Scrcpy Control Panel.app
+```
+
+这个 app 只是快速启动器，实际仍运行仓库里的 `tools/scrcpy-control-panel.py`。
+可以把它复制到 `/Applications`，但不要从仓库里移动走；复制后它会优先查找
+`~/ai-code/scrcpy/tools/scrcpy-control-panel.py`。如果仓库放在其它位置，可以设置
+`SCRCPY_CONTROL_PANEL_SCRIPT` 指向脚本路径。
+
 ## 推荐流程
 
 控制台按 4 步引导操作，并会自动禁用当前阶段不该点击的按钮：
@@ -92,6 +103,9 @@ python3 tools/scrcpy-control-panel.py --no-open
 
 关闭 `scrcpy` 投屏窗口不会自动断开 ADB。网页中的设备连接状态会继续显示
 可用，但投屏状态会在轮询刷新后切换为未运行，操控按钮也会随之禁用。
+
+点击网页右上角“关闭控制台”会停止由控制台启动的 `scrcpy` 进程，并关闭本地
+网页服务。之后再次双击 app 或重新运行脚本即可启动。
 
 ## 锁屏密码黑屏
 

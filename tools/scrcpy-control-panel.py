@@ -95,6 +95,13 @@ HTML = r"""<!doctype html>
       font-weight: 680;
       letter-spacing: 0;
     }
+    .header-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      justify-content: flex-end;
+    }
     main {
       display: grid;
       grid-template-columns: minmax(300px, 420px) minmax(420px, 1fr);
@@ -414,6 +421,7 @@ HTML = r"""<!doctype html>
     }
     @media (max-width: 720px) {
       header { align-items: flex-start; flex-direction: column; }
+      .header-actions { justify-content: flex-start; }
       .status { justify-content: flex-start; }
       main { grid-template-columns: 1fr; padding: 10px; }
       .guide { padding: 0 10px; }
@@ -428,10 +436,13 @@ HTML = r"""<!doctype html>
 <body>
   <header>
     <h1>scrcpy 控制台</h1>
-    <div class="status">
-      <span id="adbStatus" class="pill">adb</span>
-      <span id="scrcpyStatus" class="pill">scrcpy</span>
-      <span id="processStatus" class="pill">process</span>
+    <div class="header-actions">
+      <div class="status">
+        <span id="adbStatus" class="pill">adb</span>
+        <span id="scrcpyStatus" class="pill">scrcpy</span>
+        <span id="processStatus" class="pill">process</span>
+      </div>
+      <button id="shutdownPanelBtn" class="danger" title="停止 scrcpy 并关闭本地网页控制台服务">关闭控制台</button>
     </div>
   </header>
   <div class="guide">
@@ -1335,6 +1346,16 @@ HTML = r"""<!doctype html>
       await status();
     }
 
+    async function shutdownPanel() {
+      if (!confirm("关闭控制台会停止由控制台启动的 scrcpy，并关闭本地网页服务。继续吗？")) {
+        return;
+      }
+      const data = await api("/api/shutdown");
+      log(data.message || "控制台已关闭");
+      $("actionHint").textContent = "控制台服务已关闭。需要再次使用时，请重新打开 Scrcpy Control Panel.app。";
+      setDisabled("button", true);
+    }
+
     async function runNextAction() {
       if (state.nextAction === "refresh") {
         await refreshDevices();
@@ -1368,6 +1389,7 @@ HTML = r"""<!doctype html>
     $("connectBtn").addEventListener("click", () => runUiAction(toggleWirelessConnection));
     $("tcpipBtn").addEventListener("click", () => runUiAction(enableTcpip));
     $("restartAdbBtn").addEventListener("click", () => runUiAction(restartAdb));
+    $("shutdownPanelBtn").addEventListener("click", () => runUiAction(shutdownPanel));
     $("copySerialBtn").addEventListener("click", async () => {
       await navigator.clipboard.writeText(selectedSerial());
       log("已复制序列号");
@@ -1733,6 +1755,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/tcpip": self.handle_tcpip,
                 "/api/start": self.handle_start,
                 "/api/stop": self.handle_stop,
+                "/api/shutdown": self.handle_shutdown,
                 "/api/restart-adb": self.handle_restart_adb,
                 "/api/keyevent": self.handle_keyevent,
                 "/api/statusbar": self.handle_statusbar,
@@ -1948,6 +1971,11 @@ class Handler(BaseHTTPRequestHandler):
     def handle_stop(self, payload: dict[str, Any]) -> None:
         message = STATE.stop_scrcpy()
         json_response(self, HTTPStatus.OK, {"ok": True, "message": message})
+
+    def handle_shutdown(self, payload: dict[str, Any]) -> None:
+        message = STATE.stop_scrcpy()
+        json_response(self, HTTPStatus.OK, {"ok": True, "message": f"{message}；控制台服务正在关闭"})
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def handle_restart_adb(self, payload: dict[str, Any]) -> None:
         adb = require_adb()

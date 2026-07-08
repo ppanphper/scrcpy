@@ -5,8 +5,6 @@ set -u
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
 APP_EXEC_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-REPO_ROOT=$(CDPATH= cd -- "$APP_EXEC_DIR/../../../.." && pwd)
-SCRIPT="$REPO_ROOT/tools/scrcpy-control-panel.py"
 LOG_DIR="$HOME/Library/Logs"
 LOG_FILE="$LOG_DIR/scrcpy-control-panel.log"
 
@@ -16,10 +14,24 @@ show_error() {
 
 mkdir -p "$LOG_DIR"
 
-if [ ! -f "$SCRIPT" ]; then
-  show_error "找不到控制台脚本：$SCRIPT"
+SCRIPT=""
+for CANDIDATE in \
+  "${SCRCPY_CONTROL_PANEL_SCRIPT:-}" \
+  "$APP_EXEC_DIR/../../../../tools/scrcpy-control-panel.py" \
+  "$HOME/ai-code/scrcpy/tools/scrcpy-control-panel.py"
+do
+  if [ -n "$CANDIDATE" ] && [ -f "$CANDIDATE" ]; then
+    SCRIPT="$CANDIDATE"
+    break
+  fi
+done
+
+if [ -z "$SCRIPT" ]; then
+  show_error "找不到控制台脚本。请确认仓库仍在 ~/ai-code/scrcpy，或设置 SCRCPY_CONTROL_PANEL_SCRIPT。"
   exit 1
 fi
+
+REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$SCRIPT")/.." && pwd)
 
 PYTHON_BIN=$(command -v python3 || true)
 if [ -z "$PYTHON_BIN" ]; then
