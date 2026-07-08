@@ -90,6 +90,8 @@ Note that USB debugging is not required to run scrcpy in [OTG mode](doc/otg.md).
  - [_Middle-click_](doc/mouse.md#mouse-bindings) triggers `HOME`
  - <kbd>Alt</kbd>+<kbd>f</kbd> toggles [fullscreen](doc/window.md#fullscreen)
  - There are many other [shortcuts](doc/shortcuts.md)
+ - A local [control panel](doc/control-panel.md) can expose common `scrcpy` and
+   `adb` commands as buttons
 
 
 ## Usage examples

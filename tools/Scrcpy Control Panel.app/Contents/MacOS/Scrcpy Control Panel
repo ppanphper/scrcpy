@@ -1,0 +1,35 @@
+#!/bin/sh
+
+set -u
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+APP_EXEC_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$APP_EXEC_DIR/../../../.." && pwd)
+SCRIPT="$REPO_ROOT/tools/scrcpy-control-panel.py"
+LOG_DIR="$HOME/Library/Logs"
+LOG_FILE="$LOG_DIR/scrcpy-control-panel.log"
+
+show_error() {
+  /usr/bin/osascript -e "display dialog \"$1\" buttons {\"好\"} default button \"好\" with icon caution" >/dev/null 2>&1 || true
+}
+
+mkdir -p "$LOG_DIR"
+
+if [ ! -f "$SCRIPT" ]; then
+  show_error "找不到控制台脚本：$SCRIPT"
+  exit 1
+fi
+
+PYTHON_BIN=$(command -v python3 || true)
+if [ -z "$PYTHON_BIN" ]; then
+  show_error "找不到 python3。请先安装 Python 3。"
+  exit 1
+fi
+
+{
+  printf '\n[%s] Launching scrcpy control panel\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  printf 'Repo: %s\n' "$REPO_ROOT"
+  printf 'Python: %s\n' "$PYTHON_BIN"
+  exec "$PYTHON_BIN" "$SCRIPT"
+} >>"$LOG_FILE" 2>&1
