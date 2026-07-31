@@ -5,7 +5,7 @@ set -u
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
 
 APP_EXEC_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-LOG_DIR="$HOME/Library/Logs"
+LOG_DIR="$HOME/Library/Logs/scrcpy-control-panel"
 LOG_FILE="$LOG_DIR/scrcpy-control-panel.log"
 
 show_error() {

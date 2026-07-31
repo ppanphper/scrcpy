@@ -32,6 +32,9 @@ from urllib.request import urlopen
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 27190
 DEFAULT_SCREENSHOT_DIR = Path.home() / "Pictures" / "scrcpy-control-panel"
+DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / "scrcpy-control-panel"
+SCRCPY_LOG_TAIL_BYTES = 12000
+ADB_COMMAND_LOCK = threading.Lock()
 
 
 KEYEVENTS = {
@@ -950,11 +953,13 @@ HTML = r"""<!doctype html>
       scrcpyKnown: false,
       scrcpyPid: null,
       scrcpyExitCode: null,
+      scrcpyLogPath: "",
       wirelessConnected: false,
       nextAction: "refresh",
       busy: false
     };
     const $ = (id) => document.getElementById(id);
+    let statusPromise = null;
     const startupOptionIds = [
       "maxSize", "bitRate", "maxFps", "videoCodec", "videoSource", "videoBuffer", "crop", "displayId", "captureOrientation",
       "noVideo", "noVideoPlayback", "noDownsizeOnError", "noMipmaps", "printFps",
@@ -1184,22 +1189,45 @@ HTML = r"""<!doctype html>
       }
     }
 
-    async function api(path, payload) {
-      const res = await fetch(path, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload || {})
-      });
-      const data = await res.json();
+    async function fetchJson(path, options = {}, timeoutMs = 15000) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      let res;
+      let text = "";
+      try {
+        res = await fetch(path, { ...options, signal: controller.signal });
+        text = await res.text();
+      } catch (err) {
+        if (err.name === "AbortError") {
+          throw new Error("请求超时：ADB 可能暂时无响应，请稍后重试或点击“重启 ADB”。");
+        }
+        throw err;
+      } finally {
+        clearTimeout(timer);
+      }
+      let data = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        throw new Error(text || res.statusText || "控制台返回了非 JSON 响应");
+      }
       if (!res.ok || !data.ok) {
-        throw new Error(data.error || data.stderr || data.stdout || res.statusText);
+        const details = data.log_tail ? `\n\nscrcpy 最近日志：\n${data.log_tail}` : "";
+        throw new Error((data.error || data.stderr || data.stdout || res.statusText) + details);
       }
       return data;
     }
 
-    async function status() {
-      const res = await fetch("/api/status");
-      const data = await res.json();
+    async function api(path, payload) {
+      return fetchJson(path, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload || {})
+      }, 25000);
+    }
+
+    async function doStatus() {
+      const data = await fetchJson("/api/status", {}, 12000);
       state.devices = data.devices || [];
       state.adb = !!data.adb;
       state.scrcpy = !!data.scrcpy;
@@ -1210,6 +1238,7 @@ HTML = r"""<!doctype html>
       state.scrcpyKnown = true;
       state.scrcpyPid = process.pid || null;
       state.scrcpyExitCode = process.exit_code ?? null;
+      state.scrcpyLogPath = process.log_path || "";
       $("adbStatus").textContent = data.adb ? "adb 就绪" : "缺少 adb";
       $("adbStatus").className = `pill ${data.adb ? "ok" : "bad"}`;
       $("scrcpyStatus").textContent = data.scrcpy ? "scrcpy 就绪" : "缺少 scrcpy";
@@ -1225,10 +1254,26 @@ HTML = r"""<!doctype html>
       if (wasKnown && wasRunning && !state.scrcpyRunning) {
         const suffix = state.scrcpyExitCode !== null ? `，退出码 ${state.scrcpyExitCode}` : "";
         log(`scrcpy 窗口已关闭${suffix}`);
+        if (process.log_path) log(`scrcpy 日志：${process.log_path}`);
+        if (process.log_tail) log(`scrcpy 最近日志：\n${process.log_tail}`);
       }
       renderDevices();
       updateWorkflow();
       return data;
+    }
+
+    async function status({ force = false } = {}) {
+      if (statusPromise && !force) return statusPromise;
+      if (statusPromise && force) {
+        try { await statusPromise; } catch {}
+      }
+      const promise = doStatus();
+      statusPromise = promise;
+      try {
+        return await promise;
+      } finally {
+        if (statusPromise === promise) statusPromise = null;
+      }
     }
 
     function renderDevices() {
@@ -1300,7 +1345,7 @@ HTML = r"""<!doctype html>
     }
 
     async function refreshDevices() {
-      await status();
+      await status({ force: true });
       log("已刷新设备");
     }
 
@@ -1310,26 +1355,27 @@ HTML = r"""<!doctype html>
         ? await api("/api/disconnect", { address: normalizedWirelessAddress() || activeSerial() })
         : await api("/api/connect", { address: normalizedWirelessAddress() });
       log(data.stdout || data.command);
-      await status();
+      await status({ force: true });
     }
 
     async function enableTcpip() {
       const data = await api("/api/tcpip", { serial: selectedSerial(), port: 5555 });
       if (data.address) $("wirelessAddress").value = data.address;
       log(data.stdout || data.command);
-      await status();
+      await status({ force: true });
     }
 
     async function startScrcpy() {
       const data = await api("/api/start", startPayload());
       log(data.command);
-      await status();
+      if (data.log_path) log(`scrcpy 日志：${data.log_path}`);
+      await status({ force: true });
     }
 
     async function stopScrcpy() {
       const data = await api("/api/stop");
       log(data.message || "已停止");
-      await status();
+      await status({ force: true });
     }
 
     async function toggleScrcpy() {
@@ -1343,7 +1389,7 @@ HTML = r"""<!doctype html>
     async function restartAdb() {
       const data = await api("/api/restart-adb");
       log(data.stdout || data.stderr || data.command || "ADB 已重启");
-      await status();
+      await status({ force: true });
     }
 
     async function shutdownPanel() {
@@ -1427,7 +1473,10 @@ HTML = r"""<!doctype html>
     loadPreferences();
     updateWorkflow();
     status().catch((err) => log(`错误：${err.message}`));
-    setInterval(() => status().catch(() => {}), 2000);
+    setInterval(() => {
+      if (state.busy || document.hidden || statusPromise) return;
+      status().catch(() => {});
+    }, 2500);
   </script>
 </body>
 </html>
@@ -1457,18 +1506,24 @@ class PanelState:
         self.lock = threading.Lock()
         self.scrcpy_process: subprocess.Popen[str] | None = None
         self.scrcpy_command: list[str] | None = None
+        self.scrcpy_log_path: Path | None = None
         self.last_scrcpy_pid: int | None = None
         self.last_scrcpy_command: list[str] | None = None
         self.last_scrcpy_exit_code: int | None = None
         self.last_scrcpy_exit_at: float | None = None
+        self.last_scrcpy_log_path: Path | None = None
+        self.last_scrcpy_log_tail = ""
 
     def _remember_exit_locked(self, process: subprocess.Popen[str], returncode: int) -> None:
         self.last_scrcpy_pid = process.pid
         self.last_scrcpy_command = self.scrcpy_command
         self.last_scrcpy_exit_code = returncode
         self.last_scrcpy_exit_at = time.time()
+        self.last_scrcpy_log_path = self.scrcpy_log_path
+        self.last_scrcpy_log_tail = tail_file(self.scrcpy_log_path)
         self.scrcpy_process = None
         self.scrcpy_command = None
+        self.scrcpy_log_path = None
 
     def is_scrcpy_running(self) -> bool:
         with self.lock:
@@ -1493,6 +1548,8 @@ class PanelState:
                         "command": command_text(command) if command else "",
                         "exit_code": None,
                         "exit_at": None,
+                        "log_path": str(self.scrcpy_log_path) if self.scrcpy_log_path else "",
+                        "log_tail": "",
                     }
                 self._remember_exit_locked(process, returncode)
 
@@ -1502,16 +1559,21 @@ class PanelState:
                 "command": command_text(self.last_scrcpy_command) if self.last_scrcpy_command else "",
                 "exit_code": self.last_scrcpy_exit_code,
                 "exit_at": self.last_scrcpy_exit_at,
+                "log_path": str(self.last_scrcpy_log_path) if self.last_scrcpy_log_path else "",
+                "log_tail": self.last_scrcpy_log_tail,
             }
 
-    def set_scrcpy(self, process: subprocess.Popen[str], command: list[str]) -> None:
+    def set_scrcpy(self, process: subprocess.Popen[str], command: list[str], log_path: Path) -> None:
         with self.lock:
             self.scrcpy_process = process
             self.scrcpy_command = command
+            self.scrcpy_log_path = log_path
             self.last_scrcpy_pid = None
             self.last_scrcpy_command = None
             self.last_scrcpy_exit_code = None
             self.last_scrcpy_exit_at = None
+            self.last_scrcpy_log_path = None
+            self.last_scrcpy_log_tail = ""
 
     def stop_scrcpy(self) -> str:
         with self.lock:
@@ -1523,18 +1585,25 @@ class PanelState:
                 self._remember_exit_locked(process, returncode)
                 return "scrcpy 已经停止"
 
-            if os.name == "nt":
-                process.terminate()
-            else:
-                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                if os.name == "nt":
+                    process.terminate()
+                else:
+                    os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                self._remember_exit_locked(process, process.poll() or 0)
+                return "scrcpy 已经停止"
 
         try:
             process.wait(timeout=4)
         except subprocess.TimeoutExpired:
-            if os.name == "nt":
-                process.kill()
-            else:
-                os.killpg(process.pid, signal.SIGKILL)
+            try:
+                if os.name == "nt":
+                    process.kill()
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             process.wait(timeout=4)
 
         with self.lock:
@@ -1553,8 +1622,40 @@ def command_text(args: list[str]) -> str:
     return " ".join(shlex.quote(arg) for arg in args)
 
 
-def run(args: list[str], timeout: int = 20) -> CommandResult:
+def safe_name(value: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip() or "device")
+    return name.strip("._-") or "device"
+
+
+def tail_file(path: Path | None, limit: int = SCRCPY_LOG_TAIL_BYTES) -> str:
+    if path is None:
+        return ""
     try:
+        size = path.stat().st_size
+        with path.open("rb") as stream:
+            if size > limit:
+                stream.seek(-limit, os.SEEK_END)
+            data = stream.read()
+    except OSError:
+        return ""
+    text = data.decode("utf-8", errors="replace").strip()
+    if size > limit:
+        text = "...\n" + text
+    return text
+
+
+def is_adb_command(args: list[str]) -> bool:
+    if not args:
+        return False
+    return Path(args[0]).name == "adb"
+
+
+def run(args: list[str], timeout: int = 20) -> CommandResult:
+    lock_acquired = False
+    try:
+        if is_adb_command(args):
+            ADB_COMMAND_LOCK.acquire()
+            lock_acquired = True
         completed = subprocess.run(
             args,
             text=True,
@@ -1569,6 +1670,9 @@ def run(args: list[str], timeout: int = 20) -> CommandResult:
         stdout = exc.stdout if isinstance(exc.stdout, str) else ""
         stderr = exc.stderr if isinstance(exc.stderr, str) else ""
         return CommandResult(False, command_text(args), stdout=stdout, stderr=stderr or "命令执行超时", returncode=124)
+    finally:
+        if lock_acquired:
+            ADB_COMMAND_LOCK.release()
 
     return CommandResult(
         completed.returncode == 0,
@@ -1717,7 +1821,10 @@ def json_response(handler: BaseHTTPRequestHandler, status: HTTPStatus, payload: 
     handler.send_header("content-type", "application/json; charset=utf-8")
     handler.send_header("content-length", str(len(body)))
     handler.end_headers()
-    handler.wfile.write(body)
+    try:
+        handler.wfile.write(body)
+    except (BrokenPipeError, ConnectionResetError):
+        return
 
 
 def text_response(handler: BaseHTTPRequestHandler, status: HTTPStatus, body: str, content_type: str) -> None:
@@ -1726,7 +1833,15 @@ def text_response(handler: BaseHTTPRequestHandler, status: HTTPStatus, body: str
     handler.send_header("content-type", content_type)
     handler.send_header("content-length", str(len(encoded)))
     handler.end_headers()
-    handler.wfile.write(encoded)
+    try:
+        handler.wfile.write(encoded)
+    except (BrokenPipeError, ConnectionResetError):
+        return
+
+
+class ControlPanelServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1737,13 +1852,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
-        if path == "/":
-            text_response(self, HTTPStatus.OK, HTML, "text/html; charset=utf-8")
+        try:
+            if path == "/":
+                text_response(self, HTTPStatus.OK, HTML, "text/html; charset=utf-8")
+                return
+            if path == "/api/status":
+                self.handle_status()
+                return
+            json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
+        except (BrokenPipeError, ConnectionResetError):
             return
-        if path == "/api/status":
-            self.handle_status()
-            return
-        json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
+        except Exception as exc:
+            json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
@@ -1768,6 +1888,8 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(self, HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
                 return
             route(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            return
         except Exception as exc:
             json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
 
@@ -1954,9 +2076,17 @@ class Handler(BaseHTTPRequestHandler):
         if STATE.is_scrcpy_running():
             STATE.stop_scrcpy()
 
+        DEFAULT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        log_path = DEFAULT_LOG_DIR / f"scrcpy-{stamp}-{safe_name(serial)}.log"
+        log_file = log_path.open("w", encoding="utf-8")
+        log_file.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} scrcpy launch\n")
+        log_file.write(f"$ {command_text(args)}\n\n")
+        log_file.flush()
+
         popen_kwargs: dict[str, Any] = {
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
+            "stdout": log_file,
+            "stderr": subprocess.STDOUT,
             "text": True,
         }
         if os.name == "nt":
@@ -1964,9 +2094,36 @@ class Handler(BaseHTTPRequestHandler):
         else:
             popen_kwargs["start_new_session"] = True
 
-        process = subprocess.Popen(args, **popen_kwargs)
-        STATE.set_scrcpy(process, args)
-        json_response(self, HTTPStatus.OK, {"ok": True, "command": command_text(args), "pid": process.pid})
+        try:
+            process = subprocess.Popen(args, **popen_kwargs)
+        finally:
+            log_file.close()
+
+        STATE.set_scrcpy(process, args, log_path)
+        time.sleep(0.35)
+        returncode = process.poll()
+        if returncode is not None:
+            scrcpy_status = STATE.scrcpy_status()
+            json_response(
+                self,
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "ok": False,
+                    "error": f"scrcpy 启动后立即退出，退出码 {returncode}",
+                    "command": command_text(args),
+                    "pid": process.pid,
+                    "exit_code": returncode,
+                    "log_path": str(log_path),
+                    "log_tail": scrcpy_status.get("log_tail", ""),
+                },
+            )
+            return
+
+        json_response(
+            self,
+            HTTPStatus.OK,
+            {"ok": True, "command": command_text(args), "pid": process.pid, "log_path": str(log_path)},
+        )
 
     def handle_stop(self, payload: dict[str, Any]) -> None:
         message = STATE.stop_scrcpy()
@@ -2070,7 +2227,7 @@ def main() -> int:
     args = parse_args()
     url = f"http://{args.host}:{args.port}/"
     try:
-        server = ThreadingHTTPServer((args.host, args.port), Handler)
+        server = ControlPanelServer((args.host, args.port), Handler)
     except OSError:
         if panel_is_running(url):
             print(f"scrcpy 控制台已在运行：{url}", flush=True)
