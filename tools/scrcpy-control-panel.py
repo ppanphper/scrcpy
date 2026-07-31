@@ -1848,6 +1848,8 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "ScrcpyControlPanel/0.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
+        if self.command == "GET" and urlparse(self.path).path == "/api/status":
+            return
         sys.stderr.write("%s - %s\n" % (self.log_date_time_string(), fmt % args))
 
     def do_GET(self) -> None:
