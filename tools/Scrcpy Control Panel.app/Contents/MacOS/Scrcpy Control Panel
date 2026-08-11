@@ -1,0 +1,47 @@
+#!/bin/sh
+
+set -u
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+APP_EXEC_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+LOG_DIR="$HOME/Library/Logs/scrcpy-control-panel"
+LOG_FILE="$LOG_DIR/scrcpy-control-panel.log"
+
+show_error() {
+  /usr/bin/osascript -e "display dialog \"$1\" buttons {\"好\"} default button \"好\" with icon caution" >/dev/null 2>&1 || true
+}
+
+mkdir -p "$LOG_DIR"
+
+SCRIPT=""
+for CANDIDATE in \
+  "${SCRCPY_CONTROL_PANEL_SCRIPT:-}" \
+  "$APP_EXEC_DIR/../../../../tools/scrcpy-control-panel.py" \
+  "$HOME/ai-code/scrcpy/tools/scrcpy-control-panel.py"
+do
+  if [ -n "$CANDIDATE" ] && [ -f "$CANDIDATE" ]; then
+    SCRIPT="$CANDIDATE"
+    break
+  fi
+done
+
+if [ -z "$SCRIPT" ]; then
+  show_error "找不到控制台脚本。请确认仓库仍在 ~/ai-code/scrcpy，或设置 SCRCPY_CONTROL_PANEL_SCRIPT。"
+  exit 1
+fi
+
+REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$SCRIPT")/.." && pwd)
+
+PYTHON_BIN=$(command -v python3 || true)
+if [ -z "$PYTHON_BIN" ]; then
+  show_error "找不到 python3。请先安装 Python 3。"
+  exit 1
+fi
+
+{
+  printf '\n[%s] Launching scrcpy control panel\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  printf 'Repo: %s\n' "$REPO_ROOT"
+  printf 'Python: %s\n' "$PYTHON_BIN"
+  exec "$PYTHON_BIN" "$SCRIPT"
+} >>"$LOG_FILE" 2>&1
