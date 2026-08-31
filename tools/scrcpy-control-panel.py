@@ -31,10 +31,14 @@ from urllib.request import urlopen
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 27190
+CONTROL_PANEL_VERSION = "0.2.0"
 DEFAULT_SCREENSHOT_DIR = Path.home() / "Pictures" / "scrcpy-control-panel"
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / "scrcpy-control-panel"
 SCRCPY_LOG_TAIL_BYTES = 12000
-ADB_COMMAND_LOCK = threading.Lock()
+ADB_CONNECT_INITIAL_WAIT_TIMEOUT = 2.0
+ADB_CONNECT_WAIT_TIMEOUT = 8.0
+ADB_CONNECT_POLL_INTERVAL = 0.4
+ADB_COMMAND_LOCK = threading.RLock()
 
 
 KEYEVENTS = {
@@ -97,6 +101,21 @@ HTML = r"""<!doctype html>
       font-size: 20px;
       font-weight: 680;
       letter-spacing: 0;
+    }
+    .header-brand {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+    }
+    .version-badge {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 8px;
+      color: var(--muted);
+      background: #fff;
+      font-size: 11px;
+      font-weight: 700;
+      white-space: nowrap;
     }
     .header-actions {
       display: flex;
@@ -438,7 +457,10 @@ HTML = r"""<!doctype html>
 </head>
 <body>
   <header>
-    <h1>scrcpy 控制台</h1>
+    <div class="header-brand">
+      <h1>scrcpy 控制台</h1>
+      <span id="panelVersion" class="version-badge" title="当前后端控制台版本">版本检测中</span>
+    </div>
     <div class="header-actions">
       <div class="status">
         <span id="adbStatus" class="pill">adb</span>
@@ -947,6 +969,7 @@ HTML = r"""<!doctype html>
     const state = {
       devices: [],
       preferences: {},
+      panelVersion: "",
       adb: false,
       scrcpy: false,
       scrcpyRunning: false,
@@ -1229,6 +1252,7 @@ HTML = r"""<!doctype html>
     async function doStatus() {
       const data = await fetchJson("/api/status", {}, 12000);
       state.devices = data.devices || [];
+      state.panelVersion = data.version || "未知";
       state.adb = !!data.adb;
       state.scrcpy = !!data.scrcpy;
       const wasRunning = state.scrcpyRunning;
@@ -1239,6 +1263,8 @@ HTML = r"""<!doctype html>
       state.scrcpyPid = process.pid || null;
       state.scrcpyExitCode = process.exit_code ?? null;
       state.scrcpyLogPath = process.log_path || "";
+      $("panelVersion").textContent = `v${state.panelVersion}`;
+      document.title = `scrcpy 控制台 v${state.panelVersion}`;
       $("adbStatus").textContent = data.adb ? "adb 就绪" : "缺少 adb";
       $("adbStatus").className = `pill ${data.adb ? "ok" : "bad"}`;
       $("scrcpyStatus").textContent = data.scrcpy ? "scrcpy 就绪" : "缺少 scrcpy";
@@ -1742,6 +1768,23 @@ def find_device(devices: list[dict[str, str]], serial: str) -> dict[str, str] | 
     return next((device for device in devices if device["serial"] == serial), None)
 
 
+def wait_for_adb_device(
+    serial: str,
+    timeout: float = ADB_CONNECT_WAIT_TIMEOUT,
+    poll_interval: float = ADB_CONNECT_POLL_INTERVAL,
+) -> tuple[dict[str, str] | None, list[dict[str, str]], CommandResult]:
+    deadline = time.monotonic() + timeout
+    while True:
+        devices, result = get_adb_devices()
+        device = find_device(devices, serial)
+        if device and device["state"] == "device":
+            return device, devices, result
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return device, devices, result
+        time.sleep(min(poll_interval, remaining))
+
+
 def adb_prefix(serial: str | None) -> list[str]:
     adb = require_adb()
     if serial:
@@ -1845,7 +1888,7 @@ class ControlPanelServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ScrcpyControlPanel/0.1"
+    server_version = f"ScrcpyControlPanel/{CONTROL_PANEL_VERSION}"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if self.command == "GET" and urlparse(self.path).path == "/api/status":
@@ -1919,6 +1962,7 @@ class Handler(BaseHTTPRequestHandler):
             HTTPStatus.OK,
             {
                 "ok": True,
+                "version": CONTROL_PANEL_VERSION,
                 "adb": bool(adb),
                 "adb_path": adb,
                 "adb_error": adb_error.strip(),
@@ -1932,21 +1976,74 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_connect(self, payload: dict[str, Any]) -> None:
         address = normalize_address(str(payload.get("address", "")))
-        result = run([require_adb(), "connect", address], timeout=12)
-        response = result.to_json()
-        if result.ok:
-            time.sleep(0.6)
-            devices, devices_result = get_adb_devices()
-            device = find_device(devices, address)
-            response["devices"] = devices
-            if not device or device["state"] != "device":
-                response["ok"] = False
-                response["error"] = (
-                    f"已执行 adb connect {address}，但 ADB 设备列表里没有可用的 {address}。"
-                    "请确认手机和电脑在同一网络、无线调试端口正确，并且手机已授权。"
+        adb = require_adb()
+        initial_connect_args = [adb, "connect", address]
+        kill_args = [adb, "kill-server"]
+        retry_connect_args = [adb, "connect", address]
+        with ADB_COMMAND_LOCK:
+            initial_result = run(initial_connect_args, timeout=12)
+            initial_device = None
+            initial_devices: list[dict[str, str]] = []
+            initial_devices_result: CommandResult | None = None
+            if initial_result.ok:
+                initial_device, initial_devices, initial_devices_result = wait_for_adb_device(
+                    address, timeout=ADB_CONNECT_INITIAL_WAIT_TIMEOUT
                 )
-                if devices_result.stderr.strip():
-                    response["stderr"] = "\n".join(filter(None, [response.get("stderr", ""), devices_result.stderr.strip()]))
+                if initial_device and initial_device["state"] == "device":
+                    response = initial_result.to_json()
+                    response["devices"] = initial_devices
+                    response["recovery_attempted"] = False
+                    json_response(self, HTTPStatus.OK, response)
+                    return
+
+            kill_result = run(kill_args, timeout=8)
+            if not kill_result.ok:
+                response = kill_result.to_json()
+                response["command"] = f"{command_text(initial_connect_args)} ; {command_text(kill_args)}"
+                response["stdout"] = "\n".join(
+                    filter(None, [initial_result.stdout.strip(), kill_result.stdout.strip()])
+                )
+                response["stderr"] = "\n".join(
+                    filter(None, [initial_result.stderr.strip(), kill_result.stderr.strip()])
+                )
+                response["error"] = "首次无线连接不可用，随后重启 ADB server 失败。"
+                response["devices"] = initial_devices
+                response["recovery_attempted"] = True
+                json_response(self, HTTPStatus.BAD_REQUEST, response)
+                return
+
+            retry_result = run(retry_connect_args, timeout=12)
+            response = retry_result.to_json()
+            response["command"] = (
+                f"{command_text(initial_connect_args)} ; "
+                f"{command_text(kill_args)} && {command_text(retry_connect_args)}"
+            )
+            response["stdout"] = "\n".join(
+                filter(None, [initial_result.stdout.strip(), kill_result.stdout.strip(), retry_result.stdout.strip()])
+            )
+            response["stderr"] = "\n".join(
+                filter(None, [initial_result.stderr.strip(), kill_result.stderr.strip(), retry_result.stderr.strip()])
+            )
+            response["recovery_attempted"] = True
+            if retry_result.ok:
+                device, devices, devices_result = wait_for_adb_device(address)
+                response["devices"] = devices
+                if not device or device["state"] != "device":
+                    response["ok"] = False
+                    state = device["state"] if device else "未出现在设备列表"
+                    response["error"] = (
+                        f"已重启 ADB server 并执行 adb connect {address}，"
+                        f"但等待 {ADB_CONNECT_WAIT_TIMEOUT:g} 秒后设备状态仍为 {state}。"
+                        "请确认手机 Wi-Fi 未休眠、无线调试端口正确，并且手机已授权。"
+                    )
+                    if devices_result.stderr.strip():
+                        response["stderr"] = "\n".join(
+                            filter(None, [response.get("stderr", ""), devices_result.stderr.strip()])
+                        )
+            elif initial_devices_result and initial_devices_result.stderr.strip():
+                response["stderr"] = "\n".join(
+                    filter(None, [response.get("stderr", ""), initial_devices_result.stderr.strip()])
+                )
         json_response(self, HTTPStatus.OK if response["ok"] else HTTPStatus.BAD_REQUEST, response)
 
     def handle_disconnect(self, payload: dict[str, Any]) -> None:
@@ -2237,7 +2334,7 @@ def main() -> int:
                 webbrowser.open(url)
             return 0
         raise
-    print(f"scrcpy 控制台：{url}", flush=True)
+    print(f"scrcpy 控制台 v{CONTROL_PANEL_VERSION}：{url}", flush=True)
     print("按 Ctrl+C 停止。", flush=True)
     if not args.no_open:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
