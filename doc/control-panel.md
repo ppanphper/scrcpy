@@ -59,6 +59,12 @@ http://127.0.0.1:27190/
 python3 tools/scrcpy-control-panel.py --no-open
 ```
 
+从手机下载的文件默认保存到 `~/Downloads/scrcpy-control-panel`，可以用参数改到别处：
+
+```bash
+python3 tools/scrcpy-control-panel.py --download-dir ~/Desktop/phone-files
+```
+
 macOS 也可以双击：
 
 ```text
@@ -97,6 +103,8 @@ tools/Scrcpy Control Panel.app
 - 保存截图到 `~/Pictures/scrcpy-control-panel`
 - 通过 `adb shell input text` 输入纯 ASCII 文本
 - 对当前设备执行一条 `adb shell` 命令
+- 上传文件到手机：普通文件通过 `adb push` 推送到指定目录，APK 通过 `adb install -r` 直接安装
+- 浏览手机目录并下载文件或整个目录到本机，底层使用 `adb shell ls` 和 `adb pull`
 
 ## 说明
 
@@ -115,6 +123,38 @@ tools/Scrcpy Control Panel.app
 
 控制台日志保存在 `~/Library/Logs/scrcpy-control-panel/`。如果 `scrcpy` 启动后
 异常退出，网页日志区会显示对应日志文件路径和最近的错误输出。
+
+## 文件传输
+
+文件传输区在右侧“操控”面板下方，只要有可用的 ADB 设备就能使用，不要求先启动
+scrcpy。
+
+上传：点击虚线框选择文件，或把文件从访达拖进去，可以一次选多个。点击“上传到手机”
+后，控制台会先把文件收到本机临时目录，再按下面的规则处理：
+
+- 文件名以 `.apk` 结尾且勾选了“APK 直接安装”时，执行 `adb install -r`，安装完成后
+  日志区会显示 `Success`；安装失败时会显示 `adb` 返回的失败原因，例如签名不一致。
+- 其它文件（或取消勾选后的 APK）通过 `adb push` 推送到“手机目标目录”，默认是
+  `/sdcard/Download`，保留原文件名。
+
+一批文件里某个文件失败时，后面的文件不会继续上传，已成功的会从选择列表中移除，
+方便只重传失败的文件。上传大文件时按钮会保持禁用，直到 `adb` 完成。
+
+下载：在“手机路径”填写目录后点击“浏览目录”，列表里点击目录可进入，点击文件会把
+路径填到输入框，双击文件直接下载。点击“下载到本机”会把该路径通过 `adb pull` 保存到
+本机下载目录；路径是目录时会整个目录一起下载。本机已有同名文件时会自动加上 `-2`、
+`-3` 这样的后缀，不会覆盖。
+
+点击面板右上角“打开下载目录”会在访达中打开下载目录；如果本次会话刚下载过文件，
+会直接定位到那个文件。
+
+说明：
+
+- `adb push` 会自动创建不存在的目标目录，但受 Android 存储权限限制，普通情况只能写
+  `/sdcard` 下的路径。
+- 目录浏览解析设备上 `ls -l` 的输出，已在 Android 10 的 toybox 上验证；更老的 toolbox
+  格式也做了兼容，但未实际测试。
+- 上传经过浏览器，单个文件上限 8 GB；临时文件在 `adb` 执行完成后立即删除。
 
 ## 锁屏密码黑屏
 

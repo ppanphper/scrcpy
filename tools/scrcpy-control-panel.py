@@ -10,12 +10,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -25,14 +27,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 27190
-CONTROL_PANEL_VERSION = "0.2.0"
+CONTROL_PANEL_VERSION = "0.3.0"
 DEFAULT_SCREENSHOT_DIR = Path.home() / "Pictures" / "scrcpy-control-panel"
+DEFAULT_DOWNLOAD_DIR = Path.home() / "Downloads" / "scrcpy-control-panel"
+DEFAULT_DEVICE_DIR = "/sdcard/Download"
+FILE_TRANSFER_TIMEOUT = 900
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024
+DOWNLOAD_DIR = DEFAULT_DOWNLOAD_DIR
 DEFAULT_LOG_DIR = Path.home() / "Library" / "Logs" / "scrcpy-control-panel"
 SCRCPY_LOG_TAIL_BYTES = 12000
 ADB_CONNECT_INITIAL_WAIT_TIMEOUT = 2.0
@@ -416,6 +424,89 @@ HTML = r"""<!doctype html>
     .param-group[open] > .param-title {
       margin-bottom: 2px;
     }
+    .transfer-heading {
+      margin-top: 2px;
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+    }
+    .drop-zone {
+      display: grid;
+      gap: 5px;
+      border: 1.5px dashed #b9c2cf;
+      border-radius: 8px;
+      padding: 18px 14px;
+      text-align: center;
+      background: #fafbfc;
+      cursor: pointer;
+      transition: border-color .12s ease, background .12s ease;
+    }
+    .drop-zone:hover, .drop-zone:focus-visible, .drop-zone.dragging {
+      border-color: var(--accent);
+      background: #eef6f9;
+      outline: none;
+    }
+    .drop-zone.disabled { cursor: progress; opacity: .6; }
+    .drop-zone strong { font-size: 13px; font-weight: 640; }
+    .drop-zone .field-note { word-break: break-word; }
+    .file-list {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      max-height: 280px;
+      overflow: auto;
+      background: #fff;
+    }
+    .file-list-header {
+      position: sticky;
+      top: 0;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      background: #fafbfc;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 620;
+      word-break: break-all;
+    }
+    .file-list-empty {
+      padding: 14px 10px;
+      color: var(--muted);
+      font-size: 13px;
+      text-align: center;
+    }
+    .file-row {
+      display: grid;
+      grid-template-columns: 36px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      min-height: 0;
+      border: 0;
+      border-bottom: 1px solid #eef1f5;
+      border-radius: 0;
+      padding: 7px 10px;
+      background: #fff;
+      text-align: left;
+      font-size: 13px;
+      font-weight: 540;
+      white-space: normal;
+    }
+    .file-row:last-child { border-bottom: 0; }
+    .file-row:hover { background: #f4f7fa; border-color: #eef1f5; }
+    .file-row:active { transform: none; }
+    .file-row.selected { background: #e6f1f5; }
+    .file-row:disabled { opacity: .7; background: #fff; }
+    .file-row .kind {
+      font-size: 10px;
+      font-weight: 700;
+      color: var(--muted);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 1px 4px;
+      text-align: center;
+    }
+    .file-row.dir .kind { color: var(--accent); border-color: #a9cdd9; }
+    .file-row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-row .size { color: var(--muted); font-size: 11px; white-space: nowrap; }
     .field-note {
       color: var(--muted);
       font-size: 11px;
@@ -929,41 +1020,80 @@ HTML = r"""<!doctype html>
       </section>
     </div>
 
-    <section id="controlsPanel" class="controls-panel">
-      <div class="section-header">
-        <h2>操控</h2>
-        <button id="wakeBtn" title="唤醒当前设备">唤醒</button>
-      </div>
-      <div id="controlsLocked" class="locked-message">启动 scrcpy 后显示控制按钮</div>
-      <div id="controlsBody" class="body grid hidden">
-        <div class="grid controls">
-          <button class="control-button" data-key="back" title="Android 返回">返回<span>上一页</span></button>
-          <button class="control-button" data-key="home" title="Android 主页">主页<span>回桌面</span></button>
-          <button class="control-button" data-key="apps" title="Android 多任务">多任务<span>最近应用</span></button>
-          <button class="control-button" data-key="volume_down" title="音量减">音量 -<span>调低</span></button>
-          <button class="control-button" data-key="mute" title="静音">静音<span>切换</span></button>
-          <button class="control-button" data-key="volume_up" title="音量加">音量 +<span>调高</span></button>
-          <button class="control-button" data-statusbar="expand-notifications" title="展开通知栏">通知栏<span>展开</span></button>
-          <button class="control-button" data-statusbar="expand-settings" title="展开快捷设置">快捷设置<span>展开</span></button>
-          <button class="control-button" data-statusbar="collapse" title="收起系统面板">收起面板<span>关闭</span></button>
-          <button class="control-button" data-key="power" title="电源键">电源<span>按一下</span></button>
-          <button class="control-button" data-key="sleep" title="熄屏">熄屏<span>关闭屏幕</span></button>
-          <button class="control-button" id="screenshotBtn" title="保存当前设备截图">截图<span>PNG 文件</span></button>
+    <div class="workflow-column" aria-label="操控与文件传输">
+      <section id="controlsPanel" class="controls-panel">
+        <div class="section-header">
+          <h2>操控</h2>
+          <button id="wakeBtn" title="唤醒当前设备">唤醒</button>
         </div>
-        <div class="grid two">
-          <label>输入文本
-            <input id="textInput" placeholder="仅支持可靠 ASCII 文本" autocomplete="off">
+        <div id="controlsLocked" class="locked-message">启动 scrcpy 后显示控制按钮</div>
+        <div id="controlsBody" class="body grid hidden">
+          <div class="grid controls">
+            <button class="control-button" data-key="back" title="Android 返回">返回<span>上一页</span></button>
+            <button class="control-button" data-key="home" title="Android 主页">主页<span>回桌面</span></button>
+            <button class="control-button" data-key="apps" title="Android 多任务">多任务<span>最近应用</span></button>
+            <button class="control-button" data-key="volume_down" title="音量减">音量 -<span>调低</span></button>
+            <button class="control-button" data-key="mute" title="静音">静音<span>切换</span></button>
+            <button class="control-button" data-key="volume_up" title="音量加">音量 +<span>调高</span></button>
+            <button class="control-button" data-statusbar="expand-notifications" title="展开通知栏">通知栏<span>展开</span></button>
+            <button class="control-button" data-statusbar="expand-settings" title="展开快捷设置">快捷设置<span>展开</span></button>
+            <button class="control-button" data-statusbar="collapse" title="收起系统面板">收起面板<span>关闭</span></button>
+            <button class="control-button" data-key="power" title="电源键">电源<span>按一下</span></button>
+            <button class="control-button" data-key="sleep" title="熄屏">熄屏<span>关闭屏幕</span></button>
+            <button class="control-button" id="screenshotBtn" title="保存当前设备截图">截图<span>PNG 文件</span></button>
+          </div>
+          <div class="grid two">
+            <label>输入文本
+              <input id="textInput" placeholder="仅支持可靠 ASCII 文本" autocomplete="off">
+            </label>
+            <label>ADB 命令
+              <input id="shellInput" placeholder="input keyevent 4" autocomplete="off">
+            </label>
+          </div>
+          <div class="grid two">
+            <button id="typeTextBtn" title="通过 adb shell input text 输入 ASCII 文本">输入文本</button>
+            <button id="shellBtn" title="在当前设备上执行 adb shell 命令">执行命令</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="transferPanel">
+        <div class="section-header">
+          <h2>文件传输</h2>
+          <button id="openDownloadsBtn" title="打开本机下载目录；如果刚下载过文件会直接定位到它">打开下载目录</button>
+        </div>
+        <div id="transferLocked" class="locked-message">连接 ADB 设备后可上传或下载文件</div>
+        <div id="transferBody" class="body grid hidden">
+          <div class="transfer-heading">上传到手机</div>
+          <div id="dropZone" class="drop-zone" tabindex="0" role="button" aria-label="选择或拖入要上传的文件">
+            <input id="fileInput" type="file" multiple hidden>
+            <strong id="dropZoneTitle">点击选择文件，或把文件拖到这里</strong>
+            <span id="dropZoneDetail" class="field-note">APK 会直接安装，其它文件推送到下方目录；可一次选择多个文件。</span>
+          </div>
+          <div class="grid two">
+            <label>手机目标目录
+              <input id="uploadTarget" value="/sdcard/Download" placeholder="/sdcard/Download" autocomplete="off">
+            </label>
+            <label title="勾选后 .apk 文件通过 adb install -r 安装；取消勾选则和普通文件一样推送到目标目录。" class="check"><input id="installApk" type="checkbox" checked>APK 直接安装</label>
+          </div>
+          <div class="grid two">
+            <button id="uploadBtn" class="primary" title="把已选择的文件上传到手机">上传到手机</button>
+            <button id="clearFilesBtn" title="清空已选择的文件">清空选择</button>
+          </div>
+          <div class="transfer-heading">从手机下载</div>
+          <label>手机路径
+            <input id="remotePath" value="/sdcard/Download" placeholder="/sdcard/Download" autocomplete="off">
           </label>
-          <label>ADB 命令
-            <input id="shellInput" placeholder="input keyevent 4" autocomplete="off">
-          </label>
+          <div class="grid three">
+            <button id="browseBtn" title="列出该目录的内容">浏览目录</button>
+            <button id="parentDirBtn" title="返回上一级目录">上级目录</button>
+            <button id="pullBtn" class="good" title="把该文件或整个目录下载到本机下载目录">下载到本机</button>
+          </div>
+          <div id="fileList" class="file-list hidden"></div>
+          <div id="transferNote" class="field-note">下载会保存到本机的 ~/Downloads/scrcpy-control-panel 目录。</div>
         </div>
-        <div class="grid two">
-          <button id="typeTextBtn" title="通过 adb shell input text 输入 ASCII 文本">输入文本</button>
-          <button id="shellBtn" title="在当前设备上执行 adb shell 命令">执行命令</button>
-        </div>
-      </div>
-    </section>
+      </section>
+    </div>
   </main>
   <script>
     const state = {
@@ -997,7 +1127,13 @@ HTML = r"""<!doctype html>
       "newDisplay", "flexDisplay", "noVdDestroyContent",
       "timeLimit", "pauseOnExit", "verbosity", "pushTarget", "renderDriver", "killAdbOnClose", "noCleanup", "extraArgs"
     ];
-    const preferenceIds = ["wirelessAddress", ...startupOptionIds];
+    const transferPreferenceIds = ["uploadTarget", "installApk", "remotePath"];
+    const preferenceIds = ["wirelessAddress", ...startupOptionIds, ...transferPreferenceIds];
+    const TRANSFER_TIMEOUT_MS = 20 * 60 * 1000;
+    let transferFiles = [];
+    let transferListPath = "";
+    let transferSelectedFile = "";
+    let lastDownloadPath = "";
 
     function log(message) {
       const now = new Date().toLocaleTimeString();
@@ -1106,6 +1242,17 @@ HTML = r"""<!doctype html>
       $("controlsPanel").classList.toggle("locked-panel", !canControl);
       $("controlsLocked").classList.toggle("hidden", canControl);
       $("controlsBody").classList.toggle("hidden", !canControl);
+
+      const canTransfer = canUseAdb && activeReady;
+      $("transferLocked").classList.toggle("hidden", canTransfer);
+      $("transferBody").classList.toggle("hidden", !canTransfer);
+      $("dropZone").classList.toggle("disabled", busy);
+      setDisabled("#uploadBtn", busy || !canTransfer || !transferFiles.length);
+      setDisabled("#clearFilesBtn", busy || !transferFiles.length);
+      setDisabled("#browseBtn, #parentDirBtn", busy || !canTransfer);
+      setDisabled("#pullBtn", busy || !canTransfer || !$("remotePath").value.trim());
+      setDisabled("#openDownloadsBtn", busy);
+      setDisabled(".file-row", busy);
 
       setStep(1, state.adb && state.scrcpy ? "done" : "active");
       setStep(2, activeReady ? "done" : state.adb ? "active" : "");
@@ -1241,12 +1388,12 @@ HTML = r"""<!doctype html>
       return data;
     }
 
-    async function api(path, payload) {
+    async function api(path, payload, timeoutMs = 25000) {
       return fetchJson(path, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload || {})
-      }, 25000);
+      }, timeoutMs);
     }
 
     async function doStatus() {
@@ -1442,6 +1589,162 @@ HTML = r"""<!doctype html>
       }
     }
 
+    function formatSize(bytes) {
+      if (bytes === null || bytes === undefined || Number.isNaN(Number(bytes))) return "";
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let value = Number(bytes);
+      let index = 0;
+      while (value >= 1024 && index < units.length - 1) {
+        value /= 1024;
+        index += 1;
+      }
+      return `${index === 0 ? value : value.toFixed(value >= 100 ? 0 : 1)} ${units[index]}`;
+    }
+
+    function parentPath(path) {
+      const trimmed = (path || "/").trim().replace(/\/+$/, "");
+      const index = trimmed.lastIndexOf("/");
+      return index <= 0 ? "/" : trimmed.slice(0, index);
+    }
+
+    function addFiles(list) {
+      for (const file of list || []) {
+        const duplicate = transferFiles.some((item) =>
+          item.name === file.name && item.size === file.size && item.lastModified === file.lastModified);
+        if (!duplicate) transferFiles.push(file);
+      }
+      renderSelectedFiles();
+    }
+
+    function renderSelectedFiles() {
+      if (!transferFiles.length) {
+        $("dropZoneTitle").textContent = "点击选择文件，或把文件拖到这里";
+        $("dropZoneDetail").textContent = "APK 会直接安装，其它文件推送到下方目录；可一次选择多个文件。";
+      } else {
+        const total = transferFiles.reduce((sum, file) => sum + file.size, 0);
+        $("dropZoneTitle").textContent = `已选择 ${transferFiles.length} 个文件，共 ${formatSize(total)}`;
+        $("dropZoneDetail").textContent = transferFiles.map((file) => file.name).join("、");
+      }
+      updateWorkflow();
+    }
+
+    async function uploadFile(file) {
+      const params = new URLSearchParams({
+        serial: activeSerial(),
+        name: file.name,
+        target: $("uploadTarget").value.trim(),
+        install: $("installApk").checked ? "1" : "0"
+      });
+      return fetchJson(`/api/upload?${params.toString()}`, {
+        method: "POST",
+        headers: { "content-type": "application/octet-stream" },
+        body: file
+      }, TRANSFER_TIMEOUT_MS);
+    }
+
+    async function uploadSelectedFiles() {
+      const target = $("uploadTarget").value.trim();
+      if (target && !target.startsWith("/")) {
+        throw new Error("手机目标目录必须是以 / 开头的绝对路径");
+      }
+      for (const file of [...transferFiles]) {
+        log(`正在上传 ${file.name}（${formatSize(file.size)}）...`);
+        const data = await uploadFile(file);
+        transferFiles = transferFiles.filter((item) => item !== file);
+        renderSelectedFiles();
+        if (data.action === "install") {
+          log(`已安装 ${file.name}：${data.summary || "Success"}`);
+          $("transferNote").textContent = `已安装 ${file.name}`;
+        } else {
+          log(`已推送到 ${data.remote}${data.summary ? "（" + data.summary + "）" : ""}`);
+          $("transferNote").textContent = `已推送到 ${data.remote}`;
+        }
+      }
+    }
+
+    async function browseRemote(path) {
+      const data = await api("/api/ls", { serial: activeSerial(), path });
+      transferListPath = data.path;
+      transferSelectedFile = "";
+      $("remotePath").value = data.path;
+      savePreferences();
+      renderFileList(data);
+      if (data.warning) log(`列出目录时有警告：${data.warning}`);
+    }
+
+    function renderFileList(data) {
+      const box = $("fileList");
+      box.innerHTML = "";
+      box.classList.remove("hidden");
+      const header = document.createElement("div");
+      header.className = "file-list-header";
+      header.textContent = `${data.path} · ${data.entries.length} 项 · 点击目录进入，点击文件选中，双击文件直接下载`;
+      box.appendChild(header);
+      if (!data.entries.length) {
+        const empty = document.createElement("div");
+        empty.className = "file-list-empty";
+        empty.textContent = "空目录";
+        box.appendChild(empty);
+      }
+      const kinds = { dir: "目录", file: "文件", link: "链接", other: "其它" };
+      for (const entry of data.entries) {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = `file-row ${entry.type}`;
+        row.dataset.path = entry.path;
+        row.dataset.type = entry.type;
+        row.title = entry.modified ? `${entry.path}\n${entry.modified}` : entry.path;
+        const kind = document.createElement("span");
+        kind.className = "kind";
+        kind.textContent = kinds[entry.type] || kinds.other;
+        const name = document.createElement("span");
+        name.className = "name";
+        name.textContent = entry.name + (entry.type === "dir" ? "/" : "");
+        const size = document.createElement("span");
+        size.className = "size";
+        size.textContent = entry.type === "dir" ? "" : formatSize(entry.size);
+        row.append(kind, name, size);
+        box.appendChild(row);
+      }
+      updateWorkflow();
+    }
+
+    function selectRemoteEntry(row) {
+      for (const el of $("fileList").querySelectorAll(".file-row.selected")) {
+        el.classList.remove("selected");
+      }
+      row.classList.add("selected");
+      transferSelectedFile = row.dataset.path;
+      $("remotePath").value = row.dataset.path;
+      savePreferences();
+      updateWorkflow();
+    }
+
+    async function browseCurrentPath() {
+      const value = $("remotePath").value.trim();
+      const target = transferSelectedFile && value === transferSelectedFile ? parentPath(value) : value;
+      await browseRemote(target);
+    }
+
+    async function browseParentPath() {
+      const value = $("remotePath").value.trim();
+      await browseRemote(parentPath(transferListPath || value));
+    }
+
+    async function pullRemote() {
+      const path = $("remotePath").value.trim();
+      log(`正在下载 ${path} ...`);
+      const data = await api("/api/pull", { serial: activeSerial(), path }, TRANSFER_TIMEOUT_MS);
+      lastDownloadPath = data.path;
+      log(`已下载到 ${data.path}${data.summary ? "（" + data.summary + "）" : ""}`);
+      $("transferNote").textContent = `已下载到 ${data.path}`;
+    }
+
+    async function openDownloads() {
+      const data = await api("/api/open-downloads", { path: lastDownloadPath });
+      log(`已打开 ${data.path}`);
+    }
+
     document.addEventListener("click", async (event) => {
       const target = event.target.closest("button");
       if (!target) return;
@@ -1480,6 +1783,60 @@ HTML = r"""<!doctype html>
       const data = await api("/api/shell", { serial: activeSerial(), command: $("shellInput").value });
       log(data.stdout || data.command);
     }));
+    const dropZone = $("dropZone");
+    dropZone.addEventListener("click", () => {
+      if (!state.busy) $("fileInput").click();
+    });
+    dropZone.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      if (!state.busy) $("fileInput").click();
+    });
+    dropZone.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      dropZone.classList.add("dragging");
+    });
+    dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragging"));
+    dropZone.addEventListener("drop", (event) => {
+      event.preventDefault();
+      dropZone.classList.remove("dragging");
+      if (!state.busy) addFiles(event.dataTransfer.files);
+    });
+    document.addEventListener("dragover", (event) => event.preventDefault());
+    document.addEventListener("drop", (event) => event.preventDefault());
+    $("fileInput").addEventListener("change", () => {
+      addFiles($("fileInput").files);
+      $("fileInput").value = "";
+    });
+    $("uploadBtn").addEventListener("click", () => runUiAction(uploadSelectedFiles));
+    $("clearFilesBtn").addEventListener("click", () => {
+      transferFiles = [];
+      renderSelectedFiles();
+    });
+    $("browseBtn").addEventListener("click", () => runUiAction(browseCurrentPath));
+    $("parentDirBtn").addEventListener("click", () => runUiAction(browseParentPath));
+    $("pullBtn").addEventListener("click", () => runUiAction(pullRemote));
+    $("openDownloadsBtn").addEventListener("click", () => runUiAction(openDownloads));
+    $("fileList").addEventListener("click", (event) => {
+      const row = event.target.closest(".file-row");
+      if (!row || row.disabled || state.busy) return;
+      if (row.dataset.type === "dir") {
+        runUiAction(async () => browseRemote(row.dataset.path));
+      } else {
+        selectRemoteEntry(row);
+      }
+    });
+    $("fileList").addEventListener("dblclick", (event) => {
+      const row = event.target.closest(".file-row");
+      if (!row || row.disabled || state.busy || row.dataset.type === "dir") return;
+      selectRemoteEntry(row);
+      runUiAction(pullRemote);
+    });
+    $("uploadTarget").addEventListener("input", updateWorkflow);
+    $("remotePath").addEventListener("input", () => {
+      if ($("remotePath").value.trim() !== transferSelectedFile) transferSelectedFile = "";
+      updateWorkflow();
+    });
     $("serialSelect").addEventListener("change", () => {
       if (isWirelessSerial(selectedSerial())) {
         $("wirelessAddress").value = selectedSerial();
@@ -1831,6 +2188,105 @@ def encode_adb_input_text(text: str) -> str:
         text = text.replace(char, "\\" + char)
     return text
 
+LS_LINE_RE = re.compile(
+    r"^(?P<perms>[-dlcbsp][rwxsStT-]{9})[+.@]?\s+"
+    r"(?:\d+\s+)?"
+    r"(?P<user>\S+)\s+(?P<group>\S+)\s+"
+    r"(?:(?P<size>\d+)\s+)?"
+    r"(?:\d+,\s*\d+\s+)?"
+    r"(?P<date>\d{4}-\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}(?::\d{2})?)\s+"
+    r"(?P<name>.+)$"
+)
+ENTRY_TYPES = {"d": "dir", "-": "file", "l": "link"}
+
+
+def normalize_device_path(path: str, default: str | None = DEFAULT_DEVICE_DIR) -> str:
+    path = (path or "").strip()
+    if not path:
+        if default is None:
+            raise RuntimeError("手机路径不能为空")
+        path = default
+    if any(char in path for char in ("\n", "\r", "\0")):
+        raise RuntimeError("手机路径包含非法字符")
+    if not path.startswith("/"):
+        raise RuntimeError("手机路径必须是以 / 开头的绝对路径")
+    normalized = posixpath.normpath(re.sub(r"/+", "/", path))
+    return normalized if normalized.startswith("/") else "/" + normalized
+
+
+def parse_ls_output(output: str, base: str) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for raw in output.splitlines():
+        line = raw.rstrip("\r")
+        if not line.strip() or line.startswith("total "):
+            continue
+        match = LS_LINE_RE.match(line)
+        if not match:
+            continue
+        name = match.group("name")
+        kind = ENTRY_TYPES.get(match.group("perms")[0], "other")
+        if kind == "link" and " -> " in name:
+            name = name.split(" -> ", 1)[0]
+        if name in (".", ".."):
+            continue
+        size = match.group("size")
+        entries.append(
+            {
+                "name": name,
+                "path": posixpath.join(base, name),
+                "type": kind,
+                "size": int(size) if size is not None and kind != "dir" else None,
+                "modified": f"{match.group('date')} {match.group('time')}",
+            }
+        )
+    entries.sort(key=lambda entry: (entry["type"] != "dir", entry["name"].lower()))
+    return entries
+
+
+def list_device_dir(serial: str, path: str) -> dict[str, Any]:
+    shell = f"cd {shlex.quote(path)} && ls -laL"
+    result = run(adb_prefix(serial) + ["shell", shell], timeout=20)
+    entries = parse_ls_output(result.stdout, path)
+    if not result.ok and not entries:
+        raise RuntimeError((result.stderr or result.stdout).strip() or "无法列出目录")
+    return {
+        "path": path,
+        "parent": posixpath.dirname(path) or "/",
+        "entries": entries,
+        "command": result.command,
+        "warning": result.stderr.strip() if not result.ok else "",
+    }
+
+
+def unique_local_path(directory: Path, name: str) -> Path:
+    candidate = directory / name
+    if not candidate.exists():
+        return candidate
+    stem, suffix = os.path.splitext(name)
+    for index in range(2, 1000):
+        candidate = directory / f"{stem}-{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError("下载目录中同名文件过多")
+
+
+def safe_upload_name(name: str) -> str:
+    name = name.replace("\\", "/").split("/")[-1].strip()
+    if not name or name in (".", "..") or "\0" in name:
+        raise RuntimeError("文件名无效")
+    return name
+
+
+def open_in_file_manager(path: Path, reveal: bool = False) -> list[str]:
+    if sys.platform == "darwin":
+        args = ["open", "-R", str(path)] if reveal else ["open", str(path)]
+    elif os.name == "nt":
+        args = ["explorer", f"/select,{path}"] if reveal else ["explorer", str(path)]
+    else:
+        args = ["xdg-open", str(path.parent if reveal else path)]
+    subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return args
+
 
 def payload_text(payload: dict[str, Any], *keys: str) -> str:
     for key in keys:
@@ -1913,6 +2369,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         try:
+            if path == "/api/upload":
+                self.handle_upload()
+                return
             payload = self.read_json()
             routes = {
                 "/api/connect": self.handle_connect,
@@ -1927,6 +2386,9 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/screenshot": self.handle_screenshot,
                 "/api/type-text": self.handle_type_text,
                 "/api/shell": self.handle_shell,
+                "/api/ls": self.handle_ls,
+                "/api/pull": self.handle_pull,
+                "/api/open-downloads": self.handle_open_downloads,
             }
             route = routes.get(path)
             if route is None:
@@ -1971,6 +2433,8 @@ class Handler(BaseHTTPRequestHandler):
                 "scrcpy_running": scrcpy_status["running"],
                 "scrcpy_process": scrcpy_status,
                 "devices": devices,
+                "download_dir": str(DOWNLOAD_DIR),
+                "device_dir": DEFAULT_DEVICE_DIR,
             },
         )
 
@@ -2304,12 +2768,101 @@ class Handler(BaseHTTPRequestHandler):
         result = run(adb_prefix(serial) + ["shell"] + command, timeout=20)
         json_response(self, HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST, result.to_json())
 
+    def handle_ls(self, payload: dict[str, Any]) -> None:
+        serial = str(payload.get("serial", "")).strip()
+        path = normalize_device_path(str(payload.get("path", "")))
+        listing = list_device_dir(serial, path)
+        listing["ok"] = True
+        json_response(self, HTTPStatus.OK, listing)
+
+    def handle_pull(self, payload: dict[str, Any]) -> None:
+        serial = str(payload.get("serial", "")).strip()
+        remote = normalize_device_path(str(payload.get("path", "")), default=None)
+        if remote == "/":
+            raise RuntimeError("不能直接下载整个根目录，请选择具体文件或目录")
+        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        local = unique_local_path(DOWNLOAD_DIR, posixpath.basename(remote))
+        args = adb_prefix(serial) + ["pull", remote, str(local)]
+        result = run(args, timeout=FILE_TRANSFER_TIMEOUT)
+        response = result.to_json()
+        response["remote"] = remote
+        response["path"] = str(local) if result.ok else ""
+        response["size"] = local.stat().st_size if result.ok and local.is_file() else None
+        response["summary"] = (result.stdout or result.stderr).strip().replace(f"{remote}: ", "")
+        json_response(self, HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST, response)
+
+    def handle_upload(self) -> None:
+        query = parse_qs(urlparse(self.path).query)
+
+        def first(key: str) -> str:
+            return (query.get(key) or [""])[0].strip()
+
+        serial = first("serial")
+        filename = safe_upload_name(first("name"))
+        install = first("install") in ("1", "true", "yes")
+        length = int(self.headers.get("content-length", "0") or 0)
+        if length <= 0:
+            raise RuntimeError("上传内容为空")
+        if length > MAX_UPLOAD_BYTES:
+            raise RuntimeError("文件过大，超过上传上限")
+        action = "install" if install and filename.lower().endswith(".apk") else "push"
+        remote = ""
+        if action == "push":
+            remote = posixpath.join(normalize_device_path(first("target")), filename)
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="scrcpy-control-panel-"))
+        try:
+            local = temp_dir / filename
+            received = 0
+            with local.open("wb") as stream:
+                while received < length:
+                    chunk = self.rfile.read(min(UPLOAD_CHUNK_BYTES, length - received))
+                    if not chunk:
+                        break
+                    stream.write(chunk)
+                    received += len(chunk)
+            if received != length:
+                raise RuntimeError(f"上传中断：只收到 {received} / {length} 字节")
+            if action == "install":
+                args = adb_prefix(serial) + ["install", "-r", str(local)]
+            else:
+                args = adb_prefix(serial) + ["push", str(local), remote]
+            result = run(args, timeout=FILE_TRANSFER_TIMEOUT)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        response = result.to_json()
+        summary = (result.stdout or result.stderr).strip().replace(f"{local}: ", "")
+        response.update({"action": action, "name": filename, "remote": remote, "size": received, "summary": summary})
+        json_response(self, HTTPStatus.OK if result.ok else HTTPStatus.BAD_REQUEST, response)
+
+    def handle_open_downloads(self, payload: dict[str, Any]) -> None:
+        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        requested = str(payload.get("path", "")).strip()
+        target = DOWNLOAD_DIR
+        reveal = False
+        if requested:
+            candidate = Path(requested)
+            try:
+                candidate.resolve().relative_to(DOWNLOAD_DIR.resolve())
+            except ValueError:
+                candidate = None
+            if candidate is not None and candidate.exists():
+                target, reveal = candidate, True
+        args = open_in_file_manager(target, reveal)
+        json_response(self, HTTPStatus.OK, {"ok": True, "path": str(target), "command": command_text(args)})
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="运行 scrcpy 和 adb 的本地网页控制台。")
     parser.add_argument("--host", default=DEFAULT_HOST, help=f"绑定地址，默认 {DEFAULT_HOST}")
     parser.add_argument("--port", default=DEFAULT_PORT, type=int, help=f"绑定端口，默认 {DEFAULT_PORT}")
     parser.add_argument("--no-open", action="store_true", help="不要自动打开浏览器")
+    parser.add_argument(
+        "--download-dir",
+        default=str(DEFAULT_DOWNLOAD_DIR),
+        help=f"从手机下载文件的保存目录，默认 {DEFAULT_DOWNLOAD_DIR}",
+    )
     return parser.parse_args()
 
 
@@ -2323,7 +2876,9 @@ def panel_is_running(url: str) -> bool:
 
 
 def main() -> int:
+    global DOWNLOAD_DIR
     args = parse_args()
+    DOWNLOAD_DIR = Path(args.download_dir).expanduser()
     url = f"http://{args.host}:{args.port}/"
     try:
         server = ControlPanelServer((args.host, args.port), Handler)
