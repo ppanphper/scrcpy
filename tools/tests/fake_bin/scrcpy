@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "fake scrcpy $*"
+exec sleep 30
