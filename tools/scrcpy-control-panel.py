@@ -33,7 +33,7 @@ from urllib.request import urlopen
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 27190
-CONTROL_PANEL_VERSION = "0.3.0"
+CONTROL_PANEL_VERSION = "0.3.1"
 DEFAULT_SCREENSHOT_DIR = Path.home() / "Pictures" / "scrcpy-control-panel"
 DEFAULT_DOWNLOAD_DIR = Path.home() / "Downloads" / "scrcpy-control-panel"
 DEFAULT_DEVICE_DIR = "/sdcard/Download"
@@ -46,6 +46,7 @@ SCRCPY_LOG_TAIL_BYTES = 12000
 ADB_CONNECT_INITIAL_WAIT_TIMEOUT = 2.0
 ADB_CONNECT_WAIT_TIMEOUT = 8.0
 ADB_CONNECT_POLL_INTERVAL = 0.4
+ADB_RECONNECT_WAIT_TIMEOUT = 3.0
 ADB_COMMAND_LOCK = threading.RLock()
 
 
@@ -585,7 +586,7 @@ HTML = r"""<!doctype html>
       <section>
         <div class="section-header">
           <h2>连接</h2>
-          <button id="refreshBtn" title="刷新已连接的 ADB 设备">刷新</button>
+          <button id="refreshBtn" title="刷新 ADB 设备，并自动连接已保存的无线地址">刷新</button>
         </div>
         <div class="body grid">
           <label>设备
@@ -599,7 +600,7 @@ HTML = r"""<!doctype html>
           </div>
           <div class="grid three">
             <button id="tcpipBtn" class="warn" title="为已选择的 USB 设备开启 ADB TCP/IP">开启 TCP/IP</button>
-            <button id="restartAdbBtn" title="重启本机 ADB 服务；无线设备会断开，需要重新连接">重启 ADB</button>
+            <button id="restartAdbBtn" title="重启本机 ADB 服务，并自动重连无线设备">重启 ADB</button>
             <button id="copySerialBtn" title="复制当前设备序列号">复制序列号</button>
           </div>
           <div id="deviceSummary" class="muted"></div>
@@ -1108,6 +1109,7 @@ HTML = r"""<!doctype html>
       scrcpyExitCode: null,
       scrcpyLogPath: "",
       wirelessConnected: false,
+      manualDisconnect: "",
       nextAction: "refresh",
       busy: false
     };
@@ -1172,6 +1174,15 @@ HTML = r"""<!doctype html>
       const address = $("wirelessAddress").value.trim();
       if (!address) return "";
       return address.includes(":") ? address : `${address}:5555`;
+    }
+
+    function autoReconnectAddress() {
+      const address = normalizedWirelessAddress();
+      return address && address !== state.manualDisconnect ? address : "";
+    }
+
+    function logReconnect(results) {
+      for (const item of results || []) log(item.message);
     }
 
     function connectedWirelessDevice() {
@@ -1339,6 +1350,7 @@ HTML = r"""<!doctype html>
         data[id] = el.type === "checkbox" ? el.checked : el.value;
       }
       data.serial = selectedSerial();
+      data.manualDisconnect = state.manualDisconnect;
       state.preferences = data;
       localStorage.setItem("scrcpyControlPanel", JSON.stringify(data));
     }
@@ -1352,6 +1364,7 @@ HTML = r"""<!doctype html>
           if (el.type === "checkbox") el.checked = !!value;
           else el.value = value;
         }
+        state.manualDisconnect = data.manualDisconnect || "";
         state.preferences = data;
         return data;
       } catch {
@@ -1517,16 +1530,26 @@ HTML = r"""<!doctype html>
       }
     }
 
-    async function refreshDevices() {
+    async function reconnectSavedWireless() {
+      const data = await api("/api/refresh", { address: autoReconnectAddress() });
+      logReconnect(data.reconnect);
       await status({ force: true });
+    }
+
+    async function refreshDevices() {
+      await reconnectSavedWireless();
       log("已刷新设备");
     }
 
     async function toggleWirelessConnection() {
+      const disconnecting = state.wirelessConnected;
+      const address = disconnecting ? normalizedWirelessAddress() || activeSerial() : normalizedWirelessAddress();
+      const data = disconnecting
+        ? await api("/api/disconnect", { address })
+        : await api("/api/connect", { address });
+      // 手动断开的地址不在刷新和重启 ADB 时自动连回，直到再次手动连接。
+      state.manualDisconnect = disconnecting ? address : "";
       savePreferences();
-      const data = state.wirelessConnected
-        ? await api("/api/disconnect", { address: normalizedWirelessAddress() || activeSerial() })
-        : await api("/api/connect", { address: normalizedWirelessAddress() });
       log(data.stdout || data.command);
       await status({ force: true });
     }
@@ -1539,7 +1562,13 @@ HTML = r"""<!doctype html>
     }
 
     async function startScrcpy() {
-      const data = await api("/api/start", startPayload());
+      const payload = startPayload();
+      const data = await api("/api/start", payload);
+      if (payload.serial && payload.serial === state.manualDisconnect) {
+        state.manualDisconnect = "";
+        savePreferences();
+      }
+      logReconnect(data.reconnect);
       log(data.command);
       if (data.log_path) log(`scrcpy 日志：${data.log_path}`);
       await status({ force: true });
@@ -1560,8 +1589,9 @@ HTML = r"""<!doctype html>
     }
 
     async function restartAdb() {
-      const data = await api("/api/restart-adb");
+      const data = await api("/api/restart-adb", { address: autoReconnectAddress() }, 60000);
       log(data.stdout || data.stderr || data.command || "ADB 已重启");
+      logReconnect(data.reconnect);
       await status({ force: true });
     }
 
@@ -1855,7 +1885,11 @@ HTML = r"""<!doctype html>
 
     loadPreferences();
     updateWorkflow();
-    status().catch((err) => log(`错误：${err.message}`));
+    status()
+      .then(() => {
+        if (autoReconnectAddress() && !connectedWirelessDevice()) return runUiAction(reconnectSavedWireless);
+      })
+      .catch((err) => log(`错误：${err.message}`));
     setInterval(() => {
       if (state.busy || document.hidden || statusPromise) return;
       status().catch(() => {});
@@ -2142,6 +2176,68 @@ def wait_for_adb_device(
         time.sleep(min(poll_interval, remaining))
 
 
+def is_wireless_serial(serial: str) -> bool:
+    return bool(re.fullmatch(r".+:\d+", serial))
+
+
+def reconnect_failure_hint(output: str) -> str:
+    if "refused" in output.lower():
+        return "手机可能重启过，无线 ADB 端口已关闭，请用 USB 连接后点击开启 TCP/IP（adb tcpip 5555）。"
+    return "请确认手机和电脑在同一网络、手机未休眠，并且地址和端口正确。"
+
+
+def reconnect_wireless(
+    addresses: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], CommandResult]:
+    """对不在设备列表中或已离线的无线地址补一次 adb connect。
+
+    刷新列表和重启 ADB server 都不会主动连接无线设备，这里补上这一步。
+    已可用的地址直接跳过；未授权的地址需要在手机上确认，不重复连接。
+    """
+    adb = require_adb()
+    results: list[dict[str, Any]] = []
+    with ADB_COMMAND_LOCK:
+        devices, devices_result = get_adb_devices()
+        for address in dict.fromkeys(addresses):
+            device = find_device(devices, address)
+            state = device["state"] if device else ""
+            if state == "device":
+                continue
+            if state in ("unauthorized", "authorizing"):
+                results.append(
+                    {
+                        "address": address,
+                        "ok": False,
+                        "state": state,
+                        "message": f"{address} 等待授权，请在手机上允许 USB 调试。",
+                    }
+                )
+                continue
+            if device:
+                # offline 的旧连接不会自行恢复，先断开再重连。
+                run([adb, "disconnect", address], timeout=8)
+            connect = run([adb, "connect", address], timeout=12)
+            output = "\n".join(filter(None, [connect.stdout.strip(), connect.stderr.strip()]))
+            wait = ADB_RECONNECT_WAIT_TIMEOUT if connect.ok and "connected to" in output else 0
+            device, devices, devices_result = wait_for_adb_device(address, timeout=wait)
+            ok = bool(device and device["state"] == "device")
+            if ok:
+                message = f"已自动连接 {address}"
+            else:
+                reason = output or (device["state"] if device else "未出现在设备列表")
+                message = f"自动连接 {address} 失败：{reason}。{reconnect_failure_hint(output)}"
+            results.append(
+                {
+                    "address": address,
+                    "ok": ok,
+                    "state": device["state"] if device else "",
+                    "command": connect.command,
+                    "message": message,
+                }
+            )
+    return results, devices, devices_result
+
+
 def adb_prefix(serial: str | None) -> list[str]:
     adb = require_adb()
     if serial:
@@ -2374,6 +2470,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             payload = self.read_json()
             routes = {
+                "/api/refresh": self.handle_refresh,
                 "/api/connect": self.handle_connect,
                 "/api/disconnect": self.handle_disconnect,
                 "/api/tcpip": self.handle_tcpip,
@@ -2437,6 +2534,17 @@ class Handler(BaseHTTPRequestHandler):
                 "device_dir": DEFAULT_DEVICE_DIR,
             },
         )
+
+    def handle_refresh(self, payload: dict[str, Any]) -> None:
+        address = payload_text(payload, "address")
+        addresses = [normalize_address(address)] if address else []
+        reconnect, devices, result = reconnect_wireless(addresses)
+        if not result.ok:
+            response = result.to_json()
+            response["reconnect"] = reconnect
+            json_response(self, HTTPStatus.BAD_REQUEST, response)
+            return
+        json_response(self, HTTPStatus.OK, {"ok": True, "devices": devices, "reconnect": reconnect})
 
     def handle_connect(self, payload: dict[str, Any]) -> None:
         address = normalize_address(str(payload.get("address", "")))
@@ -2636,6 +2744,18 @@ class Handler(BaseHTTPRequestHandler):
         if extra_args:
             args += shlex.split(extra_args)
 
+        reconnect: list[dict[str, Any]] = []
+        if serial and is_wireless_serial(serial):
+            reconnect, _, _ = reconnect_wireless([serial])
+            failed = next((item for item in reconnect if not item["ok"]), None)
+            if failed:
+                json_response(
+                    self,
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": failed["message"], "reconnect": reconnect},
+                )
+                return
+
         if STATE.is_scrcpy_running():
             STATE.stop_scrcpy()
 
@@ -2685,7 +2805,13 @@ class Handler(BaseHTTPRequestHandler):
         json_response(
             self,
             HTTPStatus.OK,
-            {"ok": True, "command": command_text(args), "pid": process.pid, "log_path": str(log_path)},
+            {
+                "ok": True,
+                "command": command_text(args),
+                "pid": process.pid,
+                "log_path": str(log_path),
+                "reconnect": reconnect,
+            },
         )
 
     def handle_stop(self, payload: dict[str, Any]) -> None:
@@ -2699,8 +2825,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_restart_adb(self, payload: dict[str, Any]) -> None:
         adb = require_adb()
-        stop = run([adb, "kill-server"], timeout=8)
-        start = run([adb, "start-server"], timeout=8)
+        address = payload_text(payload, "address")
+        reconnect: list[dict[str, Any]] = []
+        devices: list[dict[str, str]] = []
+        with ADB_COMMAND_LOCK:
+            # kill-server 会断开全部无线连接，先记下来，重启后逐个连回。
+            before, _ = get_adb_devices()
+            addresses = [device["serial"] for device in before if is_wireless_serial(device["serial"])]
+            if address:
+                addresses.append(normalize_address(address))
+            stop = run([adb, "kill-server"], timeout=8)
+            start = run([adb, "start-server"], timeout=8)
+            if start.ok:
+                reconnect, devices, _ = reconnect_wireless(addresses)
         stdout = "\n".join(filter(None, [stop.stdout.strip(), start.stdout.strip()]))
         stderr = "\n".join(filter(None, [stop.stderr.strip(), start.stderr.strip()]))
         ok = start.ok
@@ -2713,6 +2850,8 @@ class Handler(BaseHTTPRequestHandler):
                 "stdout": stdout,
                 "stderr": stderr,
                 "returncode": start.returncode,
+                "devices": devices,
+                "reconnect": reconnect,
             },
         )
 
