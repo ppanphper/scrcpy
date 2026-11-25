@@ -1,0 +1,6 @@
+#!/bin/sh
+# 测试用：模拟 Linux `ip -4 -o addr show` 输出。
+cat <<'OUT'
+1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+3: eth1    inet 172.20.5.9/24 brd 172.20.5.255 scope global eth1\       valid_lft forever preferred_lft forever
+OUT

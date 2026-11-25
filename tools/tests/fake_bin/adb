@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+# 测试用的假 adb：用 FAKE_ADB_STATE 指向的 JSON 模拟 adb server 状态。
+# kill-server 会清空无线连接；connect 只对 reachable 中的地址成功。
+import json
+import os
+import sys
+
+path = os.environ["FAKE_ADB_STATE"]
+with open(path) as f:
+    st = json.load(f)
+args = sys.argv[1:]
+st.setdefault("log", []).append(" ".join(args))
+out, code = "", 0
+if args[:1] == ["devices"]:
+    st["server"] = True
+    lines = ["List of devices attached"]
+    for serial, state in st["connected"].items():
+        lines.append(f"{serial}\t{state} product:p model:M device:d transport_id:1")
+    for serial in st.get("local", []):
+        lines.append(f"{serial}\tdevice product:sdk model:emu device:emu transport_id:9")
+    out = "\n".join(lines) + "\n"
+elif args[:2] == ["mdns", "services"]:
+    out = "List of discovered mdns services\n" + "".join(line + "\n" for line in st.get("mdns", []))
+elif args[:1] == ["kill-server"]:
+    st["server"] = False
+    st["connected"] = {}
+elif args[:1] == ["start-server"]:
+    st["server"] = True
+elif args[:1] == ["connect"]:
+    addr = args[1]
+    if st["connected"].get(addr) == "device":
+        out = f"already connected to {addr}\n"
+    elif addr in st["reachable"]:
+        st["connected"][addr] = "device"
+        out = f"connected to {addr}\n"
+    else:
+        out = f"failed to connect to '{addr}': Connection refused\n"
+        code = 1
+elif args[:1] == ["disconnect"]:
+    addr = args[1] if len(args) > 1 else None
+    if addr:
+        st["connected"].pop(addr, None)
+    else:
+        st["connected"] = {}
+    out = f"disconnected {addr or 'everything'}\n"
+with open(path, "w") as f:
+    json.dump(st, f)
+sys.stdout.write(out)
+sys.exit(code)

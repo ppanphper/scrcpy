@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import posixpath
@@ -15,25 +16,28 @@ import re
 import shlex
 import shutil
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import URLError
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 from urllib.request import urlopen
 
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 27190
-CONTROL_PANEL_VERSION = "0.3.1"
+CONTROL_PANEL_VERSION = "0.4.0"
 DEFAULT_SCREENSHOT_DIR = Path.home() / "Pictures" / "scrcpy-control-panel"
 DEFAULT_DOWNLOAD_DIR = Path.home() / "Downloads" / "scrcpy-control-panel"
 DEFAULT_DEVICE_DIR = "/sdcard/Download"
@@ -48,6 +52,23 @@ ADB_CONNECT_WAIT_TIMEOUT = 8.0
 ADB_CONNECT_POLL_INTERVAL = 0.4
 ADB_RECONNECT_WAIT_TIMEOUT = 3.0
 ADB_COMMAND_LOCK = threading.RLock()
+DISCOVER_LOCK = threading.Lock()
+DISCOVER_MAX_NETWORKS = 4
+# 手机 Wi-Fi 省电时首包延迟可达 1 秒以上，超时过短会漏掉设备。
+DISCOVER_CONNECT_TIMEOUT = 1.5
+DISCOVER_READ_TIMEOUT = 1.5
+DISCOVER_WORKERS = 256
+# 文件传输等长时间 adb 命令占用时，扫描不等它结束，只返回扫描结果。
+DISCOVER_ADB_LOCK_TIMEOUT = 3.0
+ADB_HEADER = struct.Struct("<6I")
+ADB_CNXN = 0x4E584E43
+ADB_AUTH = 0x48545541
+ADB_STLS = 0x534C5453
+ADB_HOST_BANNER = b"host::\x00"
+ADB_DISCOVERY_MESSAGE = ADB_HEADER.pack(
+    ADB_CNXN, 0x01000001, 256 * 1024, len(ADB_HOST_BANNER),
+    sum(ADB_HOST_BANNER) & 0xFFFFFFFF, ADB_CNXN ^ 0xFFFFFFFF,
+) + ADB_HOST_BANNER
 
 
 KEYEVENTS = {
@@ -508,6 +529,7 @@ HTML = r"""<!doctype html>
     .file-row.dir .kind { color: var(--accent); border-color: #a9cdd9; }
     .file-row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .file-row .size { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    #discoverList .file-row { grid-template-columns: max-content max-content minmax(0, 1fr); }
     .field-note {
       color: var(--muted);
       font-size: 11px;
@@ -596,8 +618,10 @@ HTML = r"""<!doctype html>
             <input id="wirelessAddress" placeholder="192.168.3.41:5555" autocomplete="off">
           </label>
           <div class="grid two">
-            <button id="connectBtn" class="primary wide" title="连接无线 ADB 地址">无线连接</button>
+            <button id="connectBtn" class="primary" title="连接无线 ADB 地址">无线连接</button>
+            <button id="discoverBtn" title="扫描局域网中开启了无线 ADB 的设备">扫描局域网</button>
           </div>
+          <div id="discoverList" class="file-list hidden"></div>
           <div class="grid three">
             <button id="tcpipBtn" class="warn" title="为已选择的 USB 设备开启 ADB TCP/IP">开启 TCP/IP</button>
             <button id="restartAdbBtn" title="重启本机 ADB 服务，并自动重连无线设备">重启 ADB</button>
@@ -1110,6 +1134,7 @@ HTML = r"""<!doctype html>
       scrcpyLogPath: "",
       wirelessConnected: false,
       manualDisconnect: "",
+      pinnedSerial: "",
       nextAction: "refresh",
       busy: false
     };
@@ -1147,7 +1172,15 @@ HTML = r"""<!doctype html>
       return $("serialSelect").value.trim();
     }
 
+    function pinnedDevice() {
+      // 用户在下拉框或扫描列表中明确选择的设备，优先于无线地址对应的设备。
+      if (!state.pinnedSerial) return null;
+      return state.devices.find((device) => device.serial === state.pinnedSerial && isReadyDevice(device)) || null;
+    }
+
     function activeSerial() {
+      const pinned = pinnedDevice();
+      if (pinned && selectedSerial() === pinned.serial) return pinned.serial;
       const wireless = connectedWirelessDevice();
       return wireless ? wireless.serial : selectedSerial();
     }
@@ -1235,12 +1268,12 @@ HTML = r"""<!doctype html>
       const connectBtn = $("connectBtn");
       connectBtn.textContent = state.wirelessConnected ? "断开连接" : "无线连接";
       connectBtn.title = state.wirelessConnected ? "断开当前无线 ADB 连接" : "连接无线 ADB 地址";
-      connectBtn.className = state.wirelessConnected ? "danger solid wide" : "primary wide";
+      connectBtn.className = state.wirelessConnected ? "danger solid" : "primary";
       const startBtn = $("startBtn");
       startBtn.textContent = state.scrcpyRunning ? "停止 scrcpy" : "启动 scrcpy";
       startBtn.title = state.scrcpyRunning ? "停止由本控制台启动的 scrcpy 进程" : "为当前设备启动 scrcpy";
       startBtn.className = state.scrcpyRunning ? "danger solid" : "good";
-      setDisabled("#refreshBtn", busy);
+      setDisabled("#refreshBtn, #discoverBtn", busy);
       setDisabled("#connectBtn", busy || !canUseAdb || (!state.wirelessConnected && !address));
       setDisabled("#tcpipBtn", busy || !canUseAdb || !usb);
       setDisabled("#restartAdbBtn", busy || !canUseAdb);
@@ -1412,6 +1445,9 @@ HTML = r"""<!doctype html>
     async function doStatus() {
       const data = await fetchJson("/api/status", {}, 12000);
       state.devices = data.devices || [];
+      for (const row of $("discoverList").querySelectorAll(".file-row")) {
+        updateDiscoverRow(row, discoveredAdbDevice(row));
+      }
       state.panelVersion = data.version || "未知";
       state.adb = !!data.adb;
       state.scrcpy = !!data.scrcpy;
@@ -1485,7 +1521,8 @@ HTML = r"""<!doctype html>
         $("wirelessAddress").value = select.value;
       }
       const connected = connectedWirelessDevice();
-      if (connected) {
+      const pinned = pinnedDevice();
+      if (connected && !(pinned && select.value === pinned.serial)) {
         select.value = connected.serial;
       }
       const usable = state.devices.filter((device) => device.state === "device");
@@ -1541,17 +1578,88 @@ HTML = r"""<!doctype html>
       log("已刷新设备");
     }
 
-    async function toggleWirelessConnection() {
-      const disconnecting = state.wirelessConnected;
+    async function toggleWirelessConnection(disconnecting = state.wirelessConnected) {
       const address = disconnecting ? normalizedWirelessAddress() || activeSerial() : normalizedWirelessAddress();
       const data = disconnecting
         ? await api("/api/disconnect", { address })
         : await api("/api/connect", { address });
       // 手动断开的地址不在刷新和重启 ADB 时自动连回，直到再次手动连接。
       state.manualDisconnect = disconnecting ? address : "";
+      // 新连上的无线设备自动成为当前设备。
+      if (!disconnecting) state.pinnedSerial = "";
       savePreferences();
       log(data.stdout || data.command);
       await status({ force: true });
+    }
+
+    function discoveredAdbDevice(row) {
+      return state.devices.find((item) => {
+        return item.serial === row.dataset.address || (!!row.dataset.serial && item.serial === row.dataset.serial);
+      }) || null;
+    }
+
+    function updateDiscoverRow(row, device) {
+      row.dataset.state = device?.state || "";
+      row.querySelector(".kind").textContent = isReadyDevice(device) ? "已连接" : "可连接";
+      row.querySelector(".size").textContent = device?.model || row.dataset.name;
+    }
+
+    async function discoverDevices() {
+      const { devices, subnets, port, elapsed_ms } = await api("/api/discover", {}, 60000);
+      const box = $("discoverList");
+      const header = document.createElement("div");
+      header.className = "file-list-header";
+      header.textContent = "局域网设备";
+      box.replaceChildren(header);
+      if (!devices.length) {
+        const empty = document.createElement("div");
+        empty.className = "file-list-empty";
+        empty.textContent = "未发现设备。手机需开启无线 ADB（USB 连接后点开启 TCP/IP），并与电脑在同一局域网；息屏时可能扫不到，点亮屏幕后重试。";
+        box.appendChild(empty);
+      }
+      for (const device of devices) {
+        const row = document.createElement("button");
+        row.type = "button";
+        row.className = "file-row";
+        row.dataset.address = device.address;
+        row.dataset.serial = device.serial;
+        row.dataset.name = device.name;
+        const badge = document.createElement("span");
+        badge.className = "kind";
+        const address = document.createElement("span");
+        address.className = "name";
+        address.textContent = device.address;
+        const model = document.createElement("span");
+        model.className = "size name";
+        row.append(badge, address, model);
+        updateDiscoverRow(row, device);
+        box.appendChild(row);
+      }
+      box.classList.remove("hidden");
+      updateWorkflow();
+      const scope = subnets.length ? `扫描 ${subnets.join("、")}:${port}` : "未找到局域网 IPv4 地址，只查询了 mDNS 服务";
+      log(`${scope}，发现 ${devices.length} 台设备，用时 ${(elapsed_ms / 1000).toFixed(1)} 秒`);
+    }
+
+    async function selectDiscoveredDevice(row) {
+      state.manualDisconnect = "";
+      let device = discoveredAdbDevice(row);
+      if (!isReadyDevice(device)) {
+        await status({ force: true });
+        device = discoveredAdbDevice(row);
+      }
+      if (isReadyDevice(device)) {
+        // 通过 mDNS 自动连接的设备序列号不是 ip:port，只选中它，不改无线地址。
+        if (isWirelessSerial(device.serial)) $("wirelessAddress").value = device.serial;
+        state.pinnedSerial = device.serial;
+        $("serialSelect").value = device.serial;
+        savePreferences();
+        updateWorkflow();
+        return;
+      }
+      $("wirelessAddress").value = row.dataset.address;
+      savePreferences();
+      await toggleWirelessConnection(false);
     }
 
     async function enableTcpip() {
@@ -1792,6 +1900,11 @@ HTML = r"""<!doctype html>
     $("nextActionBtn").addEventListener("click", () => runUiAction(runNextAction));
     $("refreshBtn").addEventListener("click", () => runUiAction(refreshDevices));
     $("connectBtn").addEventListener("click", () => runUiAction(toggleWirelessConnection));
+    $("discoverBtn").addEventListener("click", () => runUiAction(discoverDevices));
+    $("discoverList").addEventListener("click", (event) => {
+      const row = event.target.closest(".file-row");
+      if (row && !row.disabled) runUiAction(() => selectDiscoveredDevice(row));
+    });
     $("tcpipBtn").addEventListener("click", () => runUiAction(enableTcpip));
     $("restartAdbBtn").addEventListener("click", () => runUiAction(restartAdb));
     $("shutdownPanelBtn").addEventListener("click", () => runUiAction(shutdownPanel));
@@ -1868,6 +1981,7 @@ HTML = r"""<!doctype html>
       updateWorkflow();
     });
     $("serialSelect").addEventListener("change", () => {
+      state.pinnedSerial = selectedSerial();
       if (isWirelessSerial(selectedSerial())) {
         $("wirelessAddress").value = selectedSerial();
       }
@@ -2067,11 +2181,14 @@ def is_adb_command(args: list[str]) -> bool:
     return Path(args[0]).name == "adb"
 
 
-def run(args: list[str], timeout: int = 20) -> CommandResult:
+def run(args: list[str], timeout: int = 20, lock_timeout: float | None = None) -> CommandResult:
     lock_acquired = False
     try:
         if is_adb_command(args):
-            ADB_COMMAND_LOCK.acquire()
+            if lock_timeout is None:
+                ADB_COMMAND_LOCK.acquire()
+            elif not ADB_COMMAND_LOCK.acquire(timeout=lock_timeout):
+                return CommandResult(False, command_text(args), stderr="ADB 正忙，请稍后再试", returncode=125)
             lock_acquired = True
         completed = subprocess.run(
             args,
@@ -2153,6 +2270,119 @@ def get_adb_devices() -> tuple[list[dict[str, str]], CommandResult]:
     result = run([adb, "devices", "-l"], timeout=8)
     devices = parse_devices(result.stdout) if result.ok else []
     return devices, result
+
+
+def discovery_subnets(payload: dict[str, Any]) -> list[ipaddress.IPv4Network]:
+    if "subnet" in payload:
+        subnet = payload["subnet"]
+        if not isinstance(subnet, str):
+            raise RuntimeError("请填写有效的 IPv4 网段")
+        try:
+            network = ipaddress.ip_network(subnet, strict=False)
+        except ValueError as exc:
+            raise RuntimeError("请填写有效的 IPv4 网段") from exc
+        if not isinstance(network, ipaddress.IPv4Network):
+            raise RuntimeError("请填写 IPv4 网段")
+        if network.num_addresses > 1024:
+            raise RuntimeError("扫描范围最多为 1024 个地址")
+        if not network.is_private:
+            raise RuntimeError("请选择局域网 IPv4 网段")
+        return [network]
+
+    # 默认路由所在网段优先，其余网卡的网段按地址排序，最多扫描 DISCOVER_MAX_NETWORKS 个。
+    private_ranges = tuple(map(ipaddress.IPv4Network, ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")))
+
+    def lan_network(address: str) -> ipaddress.IPv4Network | None:
+        try:
+            ip = ipaddress.IPv4Address(address)
+        except ipaddress.AddressValueError:
+            return None
+        if not any(ip in subnet for subnet in private_ranges):
+            return None
+        return ipaddress.IPv4Network((ip, 24), strict=False)
+
+    default_network = None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("192.0.2.1", 9))
+            default_network = lan_network(sock.getsockname()[0])
+    except OSError:
+        pass
+    others = {network for network in map(lan_network, local_ipv4_addresses()) if network}
+    others.discard(default_network)
+    networks = ([default_network] if default_network else []) + sorted(others)
+    return networks[:DISCOVER_MAX_NETWORKS]
+
+
+def local_ipv4_addresses() -> set[str]:
+    addresses: set[str] = set()
+    # macOS 和部分 Linux 有 ifconfig，较新的 Linux 只有 ip，两者都查。
+    for name, extra_args in (("ifconfig", []), ("ip", ["-4", "-o", "addr", "show"])):
+        tool = executable(name) or next(
+            (path for path in (f"/sbin/{name}", f"/usr/sbin/{name}") if os.path.exists(path)), None
+        )
+        if not tool:
+            continue
+        result = run([tool, *extra_args], timeout=3)
+        if result.ok:
+            addresses.update(re.findall(r"\binet (?:addr:)?(\d{1,3}(?:\.\d{1,3}){3})", result.stdout))
+    try:
+        addresses.update(socket.gethostbyname_ex(socket.gethostname())[2])
+    except OSError:
+        pass
+    return addresses
+
+
+def scan_adb_host(host: ipaddress.IPv4Address, port: int) -> str | None:
+    try:
+        with socket.create_connection((str(host), port), timeout=DISCOVER_CONNECT_TIMEOUT) as sock:
+            sock.sendall(ADB_DISCOVERY_MESSAGE)
+            header = bytearray()
+            deadline = time.monotonic() + DISCOVER_READ_TIMEOUT
+            while len(header) < ADB_HEADER.size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                sock.settimeout(remaining)
+                chunk = sock.recv(ADB_HEADER.size - len(header))
+                if not chunk:
+                    return None
+                header.extend(chunk)
+            command, _, _, _, _, magic = ADB_HEADER.unpack(header)
+            if command in (ADB_CNXN, ADB_AUTH, ADB_STLS) and magic == command ^ 0xFFFFFFFF:
+                return f"{host}:{port}"
+    except OSError:
+        pass
+    return None
+
+
+def mdns_adb_devices(adb: str) -> dict[str, tuple[str, str]]:
+    """返回 {ip:port: (实例名, 服务名)}；adb 通过 mDNS 自动连接的设备序列号是「实例名.服务名」。"""
+    result = run([adb, "mdns", "services"], timeout=5, lock_timeout=DISCOVER_ADB_LOCK_TIMEOUT)
+    services = {}
+    if result.ok:
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 3:
+                continue
+            name, service, address = parts
+            service = service.rstrip(".")
+            if service not in ("_adb-tls-connect._tcp", "_adb._tcp"):
+                continue
+            host, _, port = address.partition(":")
+            if not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
+                continue
+            try:
+                ip = ipaddress.IPv4Address(host)
+            except ipaddress.AddressValueError:
+                continue
+            services[f"{ip}:{int(port)}"] = (name, service)
+    return services
+
+
+def adb_address_sort_key(address: str) -> tuple[ipaddress.IPv4Address, int]:
+    host, port = address.split(":")
+    return ipaddress.IPv4Address(host), int(port)
 
 
 def find_device(devices: list[dict[str, str]], serial: str) -> dict[str, str] | None:
@@ -2447,7 +2677,37 @@ class Handler(BaseHTTPRequestHandler):
             return
         sys.stderr.write("%s - %s\n" % (self.log_date_time_string(), fmt % args))
 
+    def reject_untrusted_request(self) -> bool:
+        """拒绝跨站请求和 DNS 重绑定：Host 必须是 IP 或 localhost，带 Origin 时须与 Host 一致。"""
+        host = self.headers.get("Host", "")
+        try:
+            hostname = urlsplit(f"//{host}").hostname or ""
+        except ValueError:
+            hostname = ""
+        trusted = hostname == "localhost"
+        if not trusted:
+            try:
+                ipaddress.ip_address(hostname)
+                trusted = True
+            except ValueError:
+                pass
+        origin = self.headers.get("Origin")
+        if trusted and origin is not None:
+            try:
+                trusted = urlsplit(origin).netloc == host
+            except ValueError:
+                trusted = False
+        if not trusted:
+            json_response(
+                self,
+                HTTPStatus.FORBIDDEN,
+                {"ok": False, "error": "拒绝来自其他网页或非本机地址的请求，请通过 http://127.0.0.1 打开控制台"},
+            )
+        return not trusted
+
     def do_GET(self) -> None:
+        if self.reject_untrusted_request():
+            return
         path = urlparse(self.path).path
         try:
             if path == "/":
@@ -2463,6 +2723,8 @@ class Handler(BaseHTTPRequestHandler):
             json_response(self, HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
 
     def do_POST(self) -> None:
+        if self.reject_untrusted_request():
+            return
         path = urlparse(self.path).path
         try:
             if path == "/api/upload":
@@ -2470,6 +2732,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             payload = self.read_json()
             routes = {
+                "/api/discover": self.handle_discover,
                 "/api/refresh": self.handle_refresh,
                 "/api/connect": self.handle_connect,
                 "/api/disconnect": self.handle_disconnect,
@@ -2534,6 +2797,53 @@ class Handler(BaseHTTPRequestHandler):
                 "device_dir": DEFAULT_DEVICE_DIR,
             },
         )
+
+    def handle_discover(self, payload: dict[str, Any]) -> None:
+        started = time.monotonic()
+        port = payload.get("port", 5555)
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise RuntimeError("端口须为 1 到 65535 之间的整数")
+        if not DISCOVER_LOCK.acquire(blocking=False):
+            raise RuntimeError("正在扫描局域网，请等待本次扫描结束")
+        try:
+            networks, scanned, services, known = self.discover_adb_services(payload, port)
+        finally:
+            DISCOVER_LOCK.release()
+        found = []
+        for address in sorted(scanned | services.keys(), key=adb_address_sort_key):
+            source = []
+            if address in scanned:
+                source.append("scan")
+            name, service = services.get(address, ("", ""))
+            if name:
+                source.append("mdns")
+            # adb 通过 mDNS 自动连接时序列号是「实例名.服务名」；未连接时也返回它，便于之后匹配。
+            mdns_serial = f"{name}.{service}" if name else ""
+            device = known.get(address) or (mdns_serial and known.get(mdns_serial)) or {}
+            found.append({"address": address, "source": source, "name": name,
+                          "serial": device.get("serial", mdns_serial),
+                          "state": device.get("state", ""), "model": device.get("model", "")})
+        json_response(self, HTTPStatus.OK, {
+            "ok": True, "subnets": [str(network) for network in networks], "port": port,
+            "elapsed_ms": int((time.monotonic() - started) * 1000), "devices": found,
+        })
+
+    def discover_adb_services(
+        self, payload: dict[str, Any], port: int
+    ) -> tuple[list[ipaddress.IPv4Network], set[str], dict[str, tuple[str, str]], dict[str, dict[str, str]]]:
+        networks = discovery_subnets(payload)
+        hosts = [host for network in networks for host in network.hosts()]
+        with ThreadPoolExecutor(max_workers=DISCOVER_WORKERS) as pool:
+            scanned = {addr for addr in pool.map(lambda host: scan_adb_host(host, port), hosts) if addr}
+        services: dict[str, tuple[str, str]] = {}
+        known: dict[str, dict[str, str]] = {}
+        adb = executable("adb")
+        if adb:
+            services = mdns_adb_devices(adb)
+            result = run([adb, "devices", "-l"], timeout=8, lock_timeout=DISCOVER_ADB_LOCK_TIMEOUT)
+            if result.ok:
+                known = {device["serial"]: device for device in parse_devices(result.stdout)}
+        return networks, scanned, services, known
 
     def handle_refresh(self, payload: dict[str, Any]) -> None:
         address = payload_text(payload, "address")

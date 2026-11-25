@@ -1,0 +1,12 @@
+#!/bin/sh
+# 测试用：模拟 macOS ifconfig 输出，含一张额外私网网卡和若干应被排除的地址。
+cat <<'OUT'
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+	inet 127.0.0.1 netmask 0xff000000
+en7: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet 10.20.30.40 netmask 0xffffff00 broadcast 10.20.30.255
+en11: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet 169.254.20.1 netmask 0xffff0000 broadcast 169.254.255.255
+utun10: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
+	inet 100.103.214.113 --> 100.103.214.113 netmask 0xffffffff
+OUT
